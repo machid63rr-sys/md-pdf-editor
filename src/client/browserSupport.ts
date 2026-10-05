@@ -1,7 +1,6 @@
 export interface PickerEnvironment {
   readonly isSecureContext: boolean;
   readonly showDirectoryPicker?: unknown;
-  readonly showSaveFilePicker?: unknown;
 }
 
 export type PickerSupport =
@@ -31,7 +30,3 @@ function checkSupport(env: PickerEnvironment, api: unknown, feature: string): Pi
 /** 「フォルダを選んで、そこへ書き込む」が使えるか */
 export const checkDirectoryPickerSupport = (env: PickerEnvironment): PickerSupport =>
   checkSupport(env, env.showDirectoryPicker, 'フォルダへの直接出力');
-
-/** 「名前を付けて保存」ダイアログが使えるか */
-export const checkSaveFilePickerSupport = (env: PickerEnvironment): PickerSupport =>
-  checkSupport(env, env.showSaveFilePicker, '「名前を付けて保存」ダイアログ');

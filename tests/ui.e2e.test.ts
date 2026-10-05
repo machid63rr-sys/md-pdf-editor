@@ -77,22 +77,6 @@ beforeEach(async () => {
       return dir;
     };
   });
-  // 「名前を付けて保存」ダイアログの代わりに、OPFSに提案名のファイルを新規作成して返す。
-  // window.__cancelSave を true にすると、利用者がダイアログを閉じた場合(AbortError)を再現する
-  await page.evaluateOnNewDocument(() => {
-    (window as unknown as { showSaveFilePicker: unknown }).showSaveFilePicker = async (options: { suggestedName: string }) => {
-      if ((window as unknown as { __cancelSave?: boolean }).__cancelSave === true) {
-        throw new DOMException('The user aborted a request.', 'AbortError');
-      }
-      const dir = await navigator.storage.getDirectory();
-      try {
-        await dir.removeEntry(options.suggestedName);
-      } catch {
-        // まだ存在しない場合は何もしない
-      }
-      return dir.getFileHandle(options.suggestedName, { create: true });
-    };
-  });
   page.on('dialog', (dialog) => void dialog.accept());
 });
 
@@ -304,24 +288,26 @@ describe('画面操作(実ブラウザ)', () => {
 
   describe('保存するファイルの選択(チェックボックス)', () => {
     const state = (): Promise<{
-      name: { disabled: boolean };
+      nameDisabled: boolean;
+      suffix: string;
       folder: boolean;
       primary: string;
       primaryDisabled: boolean;
       download: boolean;
-      hint: string;
+      text: string;
     }> =>
       page.evaluate(() => {
         const buttons = [...document.querySelectorAll('button')];
         const find = (text: string) => buttons.find((b) => b.textContent?.includes(text));
         const primary = document.querySelector('.actions .button-primary') as HTMLButtonElement;
         return {
-          name: { disabled: (document.getElementById('base-name') as HTMLInputElement).disabled },
+          nameDisabled: (document.getElementById('base-name') as HTMLInputElement).disabled,
+          suffix: (document.querySelector('.field-suffix') as HTMLElement).innerText,
           folder: find('出力先フォルダを選択')?.disabled ?? true,
           primary: primary.textContent ?? '',
           primaryDisabled: primary.disabled,
           download: find('ダウンロードで保存')?.disabled ?? true,
-          hint: (document.querySelector('.output-panel') as HTMLElement).innerText,
+          text: (document.querySelector('.output-panel') as HTMLElement).innerText,
         };
       });
 
@@ -351,6 +337,28 @@ describe('画面操作(実ブラウザ)', () => {
       );
     };
 
+    const setBaseName = (value: string): Promise<void> =>
+      page.$eval(
+        '#base-name',
+        (element, name) => {
+          const input = element as HTMLInputElement;
+          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+          setter?.call(input, name);
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        },
+        value,
+      );
+
+    const savedNames = (): Promise<string[]> =>
+      page.evaluate(async () => {
+        const dir = await navigator.storage.getDirectory();
+        const names: string[] = [];
+        for await (const name of (dir as unknown as { keys(): AsyncIterable<string> }).keys()) {
+          names.push(name);
+        }
+        return names.sort();
+      });
+
     const savedFile = (name: string): Promise<{ text: string; header: string } | null> =>
       page.evaluate(async (fileName) => {
         const dir = await navigator.storage.getDirectory();
@@ -362,10 +370,23 @@ describe('画面操作(実ブラウザ)', () => {
         }
       }, name);
 
+    // フォルダを選び、出力ボタンが有効になってから押す
+    const chooseFolderAndOutput = async (label: string): Promise<void> => {
+      await clickButton('出力先フォルダを選択');
+      await page.waitForFunction(
+        (text) => !([...document.querySelectorAll('button')].find((b) => b.textContent?.includes(text))?.disabled ?? true),
+        {},
+        label,
+      );
+      await clickButton(label);
+      await page.waitForSelector('.notice-success', { timeout: 60_000 });
+    };
+
     it('初期状態は両方チェック。ファイル名を編集でき、フォルダを選んでまとめて出力する', async () => {
       await openEditor(SAMPLE);
       const initial = await state();
-      expect(initial.name.disabled).toBe(false);
+      expect(initial.nameDisabled).toBe(false);
+      expect(initial.suffix).toBe('.md / .pdf');
       expect(initial.folder).toBe(false);
       expect(initial.primary).toBe('選んだフォルダへMDとPDFを出力');
       expect(initial.download).toBe(false);
@@ -373,26 +394,27 @@ describe('画面操作(実ブラウザ)', () => {
     });
 
     it.each([
-      ['Markdown (.md)', 'PDF (.pdf)', '名前を付けてPDFを保存…'],
-      ['PDF (.pdf)', 'Markdown (.md)', '名前を付けてMDを保存…'],
-    ])('%s を外すと(%sだけ保存)、ファイル名欄・フォルダ選択・ダウンロードがグレーになり、名前を付けて保存に切り替わる', async (unchecked, _kept, expectedLabel) => {
+      ['Markdown (.md)', '.pdf', '選んだフォルダへPDFを出力'],
+      ['PDF (.pdf)', '.md', '選んだフォルダへMDを出力'],
+    ])('%s を外しても(片方だけ保存)、ファイル名を編集でき、フォルダ選択とダウンロードも使える', async (unchecked, suffix, expectedLabel) => {
       await openEditor(SAMPLE);
       await setChecked(unchecked, false);
 
       const single = await state();
-      expect(single.name.disabled).toBe(true);
-      expect(single.folder).toBe(true);
-      expect(single.download).toBe(true);
+      expect(single.nameDisabled).toBe(false);
+      expect(single.suffix).toBe(suffix);
+      expect(single.folder).toBe(false);
+      expect(single.download).toBe(false);
       expect(single.primary).toBe(expectedLabel);
-      expect(single.primaryDisabled).toBe(false);
-      expect(single.hint).toContain('名前を付けて保存」のダイアログで指定します');
+      // フォルダを選ぶまでは、出力できない
+      expect(single.primaryDisabled).toBe(true);
+      expect(single.text).not.toContain('名前を付けて保存');
       await shot('8-select-single');
 
       // 両方に戻すと、元の状態に戻る
       await setChecked(unchecked, true);
       const both = await state();
-      expect(both.name.disabled).toBe(false);
-      expect(both.folder).toBe(false);
+      expect(both.suffix).toBe('.md / .pdf');
       expect(both.primary).toBe('選んだフォルダへMDとPDFを出力');
     });
 
@@ -402,78 +424,66 @@ describe('画面操作(実ブラウザ)', () => {
       await setChecked('PDF (.pdf)', false);
 
       const none = await state();
-      expect(none.name.disabled).toBe(true);
+      expect(none.nameDisabled).toBe(true);
       expect(none.folder).toBe(true);
       expect(none.primaryDisabled).toBe(true);
       expect(none.download).toBe(true);
-      expect(none.hint).toContain('保存するファイルを1つ以上選んでください');
+      expect(none.text).toContain('保存するファイルを1つ以上選んでください');
     });
 
-    it('PDFだけ保存: ダイアログの提案名は「<名前>.pdf」。ダイアログで保存先が決まった後にPDFが書き込まれる', async () => {
+    it('PDFだけ保存: ファイル名を決めてフォルダを選ぶと、「<名前>.pdf」だけが書き込まれる', async () => {
       await openEditor(SAMPLE);
       await setChecked('Markdown (.md)', false);
-      await clickButton('名前を付けてPDFを保存');
-      await page.waitForSelector('.notice-success', { timeout: 60_000 });
+      await setBaseName('手順書');
+      await chooseFolderAndOutput('選んだフォルダへPDFを出力');
 
       const status = await page.$eval('.notice-success', (element) => (element as HTMLElement).innerText);
-      expect(status).toContain('document.pdf');
-      const pdf = await savedFile('document.pdf');
-      expect(pdf?.header).toBe('%PDF-');
-      expect(await savedFile('document.md')).toBeNull();
+      expect(status).toContain('手順書.pdf');
+      expect(status).not.toContain('手順書.md');
+      expect(await savedNames()).toEqual(['手順書.pdf']);
+      expect((await savedFile('手順書.pdf'))?.header).toBe('%PDF-');
       await shot('9-save-pdf-only');
       expect(consoleErrors).toEqual([]);
     });
 
-    it('Markdownだけ保存: 編集した内容がそのまま書き込まれる', async () => {
+    it('Markdownだけ保存: ファイル名を決めてフォルダを選ぶと、編集した内容の「<名前>.md」だけが書き込まれる', async () => {
       await openEditor(SAMPLE);
       await setChecked('PDF (.pdf)', false);
-      await clickButton('名前を付けてMDを保存');
-      await page.waitForSelector('.notice-success');
+      await chooseFolderAndOutput('選んだフォルダへMDを出力');
 
+      expect(await savedNames()).toEqual(['document.md']);
       expect((await savedFile('document.md'))?.text).toBe(SAMPLE);
-      expect(await savedFile('document.pdf')).toBeNull();
+      expect(consoleErrors).toEqual([]);
     });
 
-    it('ダイアログを閉じた(中止した)場合は、何も保存せず、エラーも出さない', async () => {
+    it('片方だけ保存でも、ファイル名に使えない文字があると、理由を表示して出力できない', async () => {
       await openEditor(SAMPLE);
-      await setChecked('Markdown (.md)', false);
-      await page.evaluate(() => {
-        (window as unknown as { __cancelSave: boolean }).__cancelSave = true;
-      });
-      await clickButton('名前を付けてPDFを保存');
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      await setChecked('PDF (.pdf)', false);
+      await setBaseName('a/b');
+      await page.waitForSelector('.field-error');
 
-      expect(await page.$('[role="alert"]')).toBeNull();
-      expect(await page.$('.notice-success')).toBeNull();
-      expect(await savedFile('document.pdf')).toBeNull();
-      // 中止の後も、続けて操作できる
-      const after = await state();
-      expect(after.primaryDisabled).toBe(false);
+      const invalid = await state();
+      expect(invalid.text).toContain('使えません');
+      expect(invalid.primaryDisabled).toBe(true);
+      expect(invalid.download).toBe(true);
     });
 
-    it('「名前を付けて保存」に対応していないブラウザで1つだけ保存する場合は、ファイル名を編集でき、ダウンロードで保存する', async () => {
-      await page.evaluateOnNewDocument(() => {
-        Object.defineProperty(window, 'showSaveFilePicker', { value: undefined, configurable: true });
-      });
+    it('片方だけ保存でもダウンロードできる: 選んだファイルだけが、入力した名前で保存される', async () => {
       const downloads = mkdtempSync(join(tmpdir(), 'md-pdf-editor-single-'));
       const client = await page.createCDPSession();
       await client.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: downloads });
       await openEditor(SAMPLE);
       await setChecked('PDF (.pdf)', false);
-
-      const single = await state();
-      expect(single.name.disabled).toBe(false);
-      expect(single.download).toBe(false);
-      expect(single.primaryDisabled).toBe(true);
+      await setBaseName('メモ');
 
       await clickButton('ダウンロードで保存');
       await page.waitForSelector('.notice-success');
       const deadline = Date.now() + 30_000;
-      while (!readdirSync(downloads).includes('document.md') && Date.now() < deadline) {
+      while (!readdirSync(downloads).includes('メモ.md') && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 200));
       }
-      expect(readdirSync(downloads).sort()).toEqual(['document.md']);
-      expect(readFileSync(join(downloads, 'document.md'), 'utf8')).toBe(SAMPLE);
+      expect(readdirSync(downloads).sort()).toEqual(['メモ.md']);
+      expect(readFileSync(join(downloads, 'メモ.md'), 'utf8')).toBe(SAMPLE);
       rmSync(downloads, { recursive: true, force: true });
     });
   });

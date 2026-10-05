@@ -78,6 +78,74 @@ describe('writeOutputs', () => {
     expect(directory.files.get('manual.pdf')).toBe('%PDF-1.7 dummy');
   });
 
+  describe('片方だけ保存', () => {
+    it('MDだけ: PDFは書き込まない', async () => {
+      const directory = new MemoryDirectory();
+      const report = await writeOutputs({ ...base, directory, pdf: null });
+
+      expect(report).toEqual({ cancelled: false, written: ['manual.md'], failed: [] });
+      expect([...directory.files.keys()]).toEqual(['manual.md']);
+    });
+
+    it('PDFだけ: MDは書き込まない', async () => {
+      const directory = new MemoryDirectory();
+      const report = await writeOutputs({ ...base, directory, markdown: null });
+
+      expect(report).toEqual({ cancelled: false, written: ['manual.pdf'], failed: [] });
+      expect([...directory.files.keys()]).toEqual(['manual.pdf']);
+    });
+
+    it('保存しないファイルが既にあっても、上書き確認の対象にせず、内容も変えない', async () => {
+      const directory = new MemoryDirectory();
+      directory.files.set('manual.md', '古い内容');
+      let asked = false;
+
+      const report = await writeOutputs({
+        ...base,
+        directory,
+        markdown: null,
+        confirmOverwrite: () => {
+          asked = true;
+          return true;
+        },
+      });
+
+      expect(asked).toBe(false);
+      expect(report.written).toEqual(['manual.pdf']);
+      expect(directory.files.get('manual.md')).toBe('古い内容');
+    });
+
+    it('保存するファイルが既にあれば、そのファイルだけを上書き確認する', async () => {
+      const directory = new MemoryDirectory();
+      directory.files.set('manual.pdf', '古い内容');
+      directory.files.set('manual.md', '別の古い内容');
+      let asked: readonly string[] = [];
+
+      await writeOutputs({
+        ...base,
+        directory,
+        markdown: null,
+        confirmOverwrite: (names) => {
+          asked = names;
+          return true;
+        },
+      });
+
+      expect(asked).toEqual(['manual.pdf']);
+    });
+
+    it('1つだけの保存が失敗したら、失敗として報告し、新規ファイルは残さない', async () => {
+      const directory = new MemoryDirectory();
+      directory.failWrite.add('manual.md');
+
+      const report = await writeOutputs({ ...base, directory, pdf: null });
+
+      expect(report.written).toEqual([]);
+      expect(report.failed).toEqual([{ name: 'manual.md', message: '書き込み失敗: manual.md' }]);
+      expect(directory.files.size).toBe(0);
+    });
+  });
+
   describe('既存ファイル', () => {
     it('存在するファイル名を渡して上書き確認し、承諾されれば上書きする', async () => {
       const directory = new MemoryDirectory();

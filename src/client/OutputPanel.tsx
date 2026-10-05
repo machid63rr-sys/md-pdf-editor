@@ -1,10 +1,9 @@
 import React, { useMemo, useState } from 'react';
-import { checkDirectoryPickerSupport, checkSaveFilePickerSupport } from './browserSupport';
+import { checkDirectoryPickerSupport } from './browserSupport';
 import { downloadBlob } from './download';
 import { validateBaseName } from './filename';
-import { describeOutputUi, outputModeOf, selectedExtensions, type FileSelection } from './outputMode';
+import { folderOutputLabel, hasSelection, NO_SELECTION_HINT, selectedExtensions, type FileSelection } from './outputMode';
 import { requestPdf } from './pdfClient';
-import { saveWithDialog, type SaveKind, type SaveResult } from './saveFile';
 import { ensureReadWrite, writeOutputs, type OutputReport } from './writeOutputs';
 
 interface OutputPanelProps {
@@ -36,34 +35,18 @@ function describeReport(report: OutputReport, folderName: string): Status {
   return { kind: 'error', text: `一部またはすべての出力に失敗しました。${written} 失敗: ${failures}` };
 }
 
-function describeSave(result: SaveResult): Status | null {
-  switch (result.kind) {
-    case 'cancelled':
-      return null;
-    case 'saved':
-      return { kind: 'success', text: `「${result.name}」を保存しました。` };
-    case 'failed':
-      return { kind: 'error', text: `「${result.name}」を保存できませんでした: ${result.message}` };
-  }
-}
-
-const KIND_LABEL: Readonly<Record<SaveKind, string>> = { markdown: 'MD', pdf: 'PDF' };
-
 /** 保存するファイルの選択、出力先フォルダの選択、MD・PDFの出力 */
 const OutputPanel: React.FC<OutputPanelProps> = ({ markdown, defaultBaseName }) => {
   const directorySupport = useMemo(() => checkDirectoryPickerSupport(window), []);
-  const saveDialogSupport = useMemo(() => checkSaveFilePickerSupport(window), []);
   const [selection, setSelection] = useState<FileSelection>({ markdown: true, pdf: true });
   const [baseName, setBaseName] = useState(defaultBaseName);
   const [directory, setDirectory] = useState<FileSystemDirectoryHandle | null>(null);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<Status | null>(null);
 
-  const mode = outputModeOf(selection);
-  const ui = describeOutputUi(mode, saveDialogSupport.supported);
+  const anySelected = hasSelection(selection);
   const nameCheck = validateBaseName(baseName);
   const isEmpty = markdown.trim() === '';
-  const nameUsable = !ui.nameEditable || nameCheck.ok;
 
   const chooseDirectory = async (): Promise<void> => {
     try {
@@ -82,50 +65,25 @@ const OutputPanel: React.FC<OutputPanelProps> = ({ markdown, defaultBaseName }) 
     }
   };
 
-  // 2つとも保存: 選んだフォルダへまとめて書き込む
+  // 選んだフォルダへ、チェックされたファイル(MD・PDFの片方または両方)を書き込む
   const outputToFolder = async (): Promise<void> => {
     if (directory === null || !nameCheck.ok) {
       return;
     }
     setBusy(true);
-    setStatus({ kind: 'info', text: 'PDFを生成しています…' });
+    setStatus(selection.pdf ? { kind: 'info', text: 'PDFを生成しています…' } : null);
     try {
       // 書き込み権限の再確認はクリック直後(ユーザー操作の有効期間内)に行う。PDF生成には数秒かかるため、その前に済ませる
       await ensureReadWrite(directory);
-      const pdf = await requestPdf(markdown);
+      const pdf = selection.pdf ? await requestPdf(markdown) : null;
       const report = await writeOutputs({
         directory,
         baseName,
-        markdown,
+        markdown: selection.markdown ? markdown : null,
         pdf,
         confirmOverwrite: (names) => window.confirm(`次のファイルは既に存在します。上書きしますか?\n\n${names.join('\n')}`),
       });
       setStatus(describeReport(report, directory.name));
-    } catch (cause) {
-      setStatus({ kind: 'error', text: messageOf(cause) });
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  // 1つだけ保存: 「名前を付けて保存」ダイアログで、保存先と名前をまとめて指定する
-  const saveOne = async (kind: SaveKind): Promise<void> => {
-    setBusy(true);
-    setStatus(null);
-    try {
-      const result = await saveWithDialog({
-        picker: (options) => window.showSaveFilePicker(options),
-        kind,
-        suggestedBaseName: baseName,
-        produce: async () => {
-          if (kind === 'markdown') {
-            return markdown;
-          }
-          setStatus({ kind: 'info', text: 'PDFを生成しています…' });
-          return requestPdf(markdown);
-        },
-      });
-      setStatus(describeSave(result));
     } catch (cause) {
       setStatus({ kind: 'error', text: messageOf(cause) });
     } finally {
@@ -189,28 +147,6 @@ const OutputPanel: React.FC<OutputPanelProps> = ({ markdown, defaultBaseName }) 
     }
   };
 
-  const primary = ((): { label: string; disabled: boolean; onClick: () => void } => {
-    switch (ui.primary) {
-      case 'folder':
-        return {
-          label: '選んだフォルダへMDとPDFを出力',
-          disabled: !directorySupport.supported || directory === null || !nameCheck.ok || isEmpty || busy,
-          onClick: () => void outputToFolder(),
-        };
-      case 'save-dialog': {
-        const kind: SaveKind = selection.markdown ? 'markdown' : 'pdf';
-        return {
-          label: `名前を付けて${KIND_LABEL[kind]}を保存…`,
-          disabled: isEmpty || busy,
-          onClick: () => void saveOne(kind),
-        };
-      }
-      case 'unavailable':
-      case 'none':
-        return { label: '選んだフォルダへMDとPDFを出力', disabled: true, onClick: () => undefined };
-    }
-  })();
-
   const toggle = (key: keyof FileSelection) => (event: React.ChangeEvent<HTMLInputElement>) =>
     setSelection((current) => ({ ...current, [key]: event.target.checked }));
 
@@ -235,26 +171,26 @@ const OutputPanel: React.FC<OutputPanelProps> = ({ markdown, defaultBaseName }) 
           className="text-input"
           value={baseName}
           onChange={(event) => setBaseName(event.target.value)}
-          disabled={!ui.nameEditable || busy}
-          aria-invalid={ui.nameEditable && !nameCheck.ok}
+          disabled={!anySelected || busy}
+          aria-invalid={anySelected && !nameCheck.ok}
           spellCheck={false}
         />
         <span className="field-suffix">{selectedExtensions(selection)}</span>
-        {ui.nameEditable && !nameCheck.ok && <p className="field-error">{nameCheck.message}</p>}
-        {ui.hint !== null && <p className="field-hint">{ui.hint}</p>}
+        {anySelected && !nameCheck.ok && <p className="field-error">{nameCheck.message}</p>}
+        {!anySelected && <p className="field-hint">{NO_SELECTION_HINT}</p>}
       </div>
 
       <div className="field">
         <button
           type="button"
           className="button"
-          disabled={!ui.folderChooserEnabled || !directorySupport.supported || busy}
+          disabled={!anySelected || !directorySupport.supported || busy}
           onClick={() => void chooseDirectory()}
         >
           出力先フォルダを選択
         </button>
         <span className="field-value">{directory === null ? '(未選択)' : directory.name}</span>
-        {ui.folderChooserEnabled &&
+        {anySelected &&
           (directorySupport.supported ? (
             <p className="field-hint">
               「ドキュメント」「ダウンロード」「デスクトップ」などのフォルダそのものは、ブラウザの制限で選べません。
@@ -263,19 +199,21 @@ const OutputPanel: React.FC<OutputPanelProps> = ({ markdown, defaultBaseName }) 
           ) : (
             <p className="field-error">{directorySupport.reason} 代わりに、下の「ダウンロードで保存」を使えます。</p>
           ))}
-        {ui.primary === 'unavailable' && !saveDialogSupport.supported && (
-          <p className="field-error">{saveDialogSupport.reason} 代わりに、下の「ダウンロードで保存」を使えます。</p>
-        )}
       </div>
 
       <div className="actions">
-        <button type="button" className="button button-primary" disabled={primary.disabled} onClick={primary.onClick}>
-          {primary.label}
+        <button
+          type="button"
+          className="button button-primary"
+          disabled={!anySelected || !directorySupport.supported || directory === null || !nameCheck.ok || isEmpty || busy}
+          onClick={() => void outputToFolder()}
+        >
+          {folderOutputLabel(selection)}
         </button>
         <button
           type="button"
           className="button"
-          disabled={!ui.downloadEnabled || !nameUsable || isEmpty || busy}
+          disabled={!anySelected || !nameCheck.ok || isEmpty || busy}
           onClick={() => void download()}
         >
           ダウンロードで保存

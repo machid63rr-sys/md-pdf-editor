@@ -1,5 +1,5 @@
 /*
- * 選択された出力先フォルダへ、MDとPDFを書き込む。
+ * 選択された出力先フォルダへ、選ばれたファイル(MD・PDFの片方または両方)を書き込む。
  * File System Access API の型そのものではなく、必要な操作だけを表すインターフェースに依存する
  * (実物の FileSystemDirectoryHandle はそのまま渡せる。テストでは、メモリ上の実装を渡す)。
  */
@@ -28,8 +28,9 @@ export interface OutputRequest {
   readonly directory: DirectoryLike;
   // 拡張子なしのファイル名(検証済みであること)
   readonly baseName: string;
-  readonly markdown: string;
-  readonly pdf: Blob;
+  // 書き込むファイルの内容。nullは「そのファイルは保存しない」(存在確認・上書き確認の対象にもしない)
+  readonly markdown: string | null;
+  readonly pdf: Blob | null;
   // 既存のファイルがある場合に、上書きしてよいかを尋ねる。falseなら何も書かない
   readonly confirmOverwrite: (existingNames: readonly string[]) => boolean | Promise<boolean>;
 }
@@ -90,12 +91,16 @@ async function writeFile(directory: DirectoryLike, name: string, data: string | 
 }
 
 export async function writeOutputs(request: OutputRequest): Promise<OutputReport> {
-  const markdownName = `${request.baseName}.md`;
-  const pdfName = `${request.baseName}.pdf`;
-  const names = [markdownName, pdfName];
+  const targets: (readonly [string, string | Blob])[] = [];
+  if (request.markdown !== null) {
+    targets.push([`${request.baseName}.md`, request.markdown]);
+  }
+  if (request.pdf !== null) {
+    targets.push([`${request.baseName}.pdf`, request.pdf]);
+  }
 
   const existing: string[] = [];
-  for (const name of names) {
+  for (const [name] of targets) {
     if (await exists(request.directory, name)) {
       existing.push(name);
     }
@@ -104,13 +109,9 @@ export async function writeOutputs(request: OutputRequest): Promise<OutputReport
     return { cancelled: true, written: [], failed: [] };
   }
 
-  // 片方が失敗してももう片方は書き、成否をファイルごとに報告する
+  // 2つ保存する場合、片方が失敗してももう片方は書き、成否をファイルごとに報告する
   const written: string[] = [];
   const failed: OutputFailure[] = [];
-  const targets: readonly (readonly [string, string | Blob])[] = [
-    [markdownName, request.markdown],
-    [pdfName, request.pdf],
-  ];
   for (const [name, data] of targets) {
     try {
       await writeFile(request.directory, name, data, existing.includes(name));
