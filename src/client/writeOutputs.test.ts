@@ -1,0 +1,215 @@
+import { describe, expect, it } from 'vitest';
+import {
+  ensureReadWrite,
+  writeOutputs,
+  type DirectoryLike,
+  type FileHandleLike,
+  type PermissionLike,
+  type WritableLike,
+} from './writeOutputs';
+
+const notFound = (): Error => Object.assign(new Error('not found'), { name: 'NotFoundError' });
+
+// メモリ上のフォルダ。実物と同じく、close()されるまで内容は確定せず、abort()で破棄される
+class MemoryDirectory implements DirectoryLike {
+  readonly files = new Map<string, string>();
+  readonly aborted: string[] = [];
+  // 指定したファイル名への書き込み(write)を失敗させる
+  failWrite = new Set<string>();
+  // 指定したファイル名の存在確認を、NotFound以外のエラーにする
+  failLookup = new Set<string>();
+  // 指定したファイル名の削除(removeEntry)を失敗させる
+  failRemove = new Set<string>();
+
+  removeEntry(name: string): Promise<void> {
+    if (this.failRemove.has(name)) {
+      return Promise.reject(new Error('削除できません'));
+    }
+    this.files.delete(name);
+    return Promise.resolve();
+  }
+
+  async getFileHandle(name: string, options?: { create?: boolean }): Promise<FileHandleLike> {
+    if (this.failLookup.has(name)) {
+      throw Object.assign(new Error('同名のフォルダがあります'), { name: 'TypeMismatchError' });
+    }
+    if (!this.files.has(name)) {
+      if (options?.create !== true) {
+        throw notFound();
+      }
+      this.files.set(name, '');
+    }
+    return { createWritable: () => Promise.resolve(this.writableFor(name)) };
+  }
+
+  private writableFor(name: string): WritableLike {
+    const previous = this.files.get(name) ?? '';
+    let pending = '';
+    return {
+      write: async (data) => {
+        if (this.failWrite.has(name)) {
+          throw new Error(`書き込み失敗: ${name}`);
+        }
+        pending += typeof data === 'string' ? data : await data.text();
+      },
+      close: () => {
+        this.files.set(name, pending);
+        return Promise.resolve();
+      },
+      abort: () => {
+        this.aborted.push(name);
+        this.files.set(name, previous);
+        return Promise.resolve();
+      },
+    };
+  }
+}
+
+const pdf = new Blob(['%PDF-1.7 dummy'], { type: 'application/pdf' });
+const base = { baseName: 'manual', markdown: '# 見出し', pdf, confirmOverwrite: () => true };
+
+describe('writeOutputs', () => {
+  it('MDとPDFの両方を書き込む', async () => {
+    const directory = new MemoryDirectory();
+    const report = await writeOutputs({ ...base, directory });
+
+    expect(report).toEqual({ cancelled: false, written: ['manual.md', 'manual.pdf'], failed: [] });
+    expect(directory.files.get('manual.md')).toBe('# 見出し');
+    expect(directory.files.get('manual.pdf')).toBe('%PDF-1.7 dummy');
+  });
+
+  describe('既存ファイル', () => {
+    it('存在するファイル名を渡して上書き確認し、承諾されれば上書きする', async () => {
+      const directory = new MemoryDirectory();
+      directory.files.set('manual.pdf', '古い内容');
+      let asked: readonly string[] = [];
+
+      const report = await writeOutputs({
+        ...base,
+        directory,
+        confirmOverwrite: (names) => {
+          asked = names;
+          return true;
+        },
+      });
+
+      expect(asked).toEqual(['manual.pdf']);
+      expect(report.written).toEqual(['manual.md', 'manual.pdf']);
+      expect(directory.files.get('manual.pdf')).toBe('%PDF-1.7 dummy');
+    });
+
+    it('断られたら、何も書かずに中止として報告する(既存の内容も変えない)', async () => {
+      const directory = new MemoryDirectory();
+      directory.files.set('manual.md', '古い内容');
+
+      const report = await writeOutputs({ ...base, directory, confirmOverwrite: () => false });
+
+      expect(report).toEqual({ cancelled: true, written: [], failed: [] });
+      expect(directory.files.get('manual.md')).toBe('古い内容');
+      expect(directory.files.has('manual.pdf')).toBe(false);
+    });
+
+    it('既存が無ければ、上書き確認は行わない', async () => {
+      let asked = false;
+      await writeOutputs({
+        ...base,
+        directory: new MemoryDirectory(),
+        confirmOverwrite: () => {
+          asked = true;
+          return true;
+        },
+      });
+      expect(asked).toBe(false);
+    });
+
+    it('存在確認がNotFound以外で失敗したら、書き込まずに例外にする', async () => {
+      const directory = new MemoryDirectory();
+      directory.failLookup.add('manual.md');
+
+      await expect(writeOutputs({ ...base, directory })).rejects.toThrowError('同名のフォルダ');
+      expect(directory.files.size).toBe(0);
+    });
+  });
+
+  describe('書き込みの失敗', () => {
+    it('MDは成功しPDFが失敗した場合、どちらが成功/失敗かを個別に報告し、失敗した新規ファイルは残さない', async () => {
+      const directory = new MemoryDirectory();
+      directory.failWrite.add('manual.pdf');
+
+      const report = await writeOutputs({ ...base, directory });
+
+      expect(report.cancelled).toBe(false);
+      expect(report.written).toEqual(['manual.md']);
+      expect(report.failed).toEqual([{ name: 'manual.pdf', message: '書き込み失敗: manual.pdf' }]);
+      expect(directory.aborted).toEqual(['manual.pdf']);
+      expect(directory.files.get('manual.md')).toBe('# 見出し');
+      expect(directory.files.has('manual.pdf')).toBe(false);
+    });
+
+    it('失敗した新規ファイルを削除できなかった場合は、空のファイルが残る可能性を報告に含める', async () => {
+      const directory = new MemoryDirectory();
+      directory.failWrite.add('manual.pdf');
+      directory.failRemove.add('manual.pdf');
+
+      const report = await writeOutputs({ ...base, directory });
+
+      expect(report.failed[0]?.message).toContain('書き込み失敗: manual.pdf');
+      expect(report.failed[0]?.message).toContain('空のファイルが残っている可能性');
+    });
+
+    it('MDが失敗してもPDFは書く', async () => {
+      const directory = new MemoryDirectory();
+      directory.failWrite.add('manual.md');
+
+      const report = await writeOutputs({ ...base, directory });
+
+      expect(report.written).toEqual(['manual.pdf']);
+      expect(report.failed.map((failure) => failure.name)).toEqual(['manual.md']);
+    });
+
+    it('上書き中に失敗した場合、元の内容に戻り、既存ファイルは削除しない', async () => {
+      const directory = new MemoryDirectory();
+      directory.files.set('manual.md', '古い内容');
+      directory.failWrite.add('manual.md');
+
+      await writeOutputs({ ...base, directory });
+
+      expect(directory.files.get('manual.md')).toBe('古い内容');
+    });
+  });
+});
+
+describe('ensureReadWrite', () => {
+  const handle = (query: PermissionState, request?: PermissionState): PermissionLike & { requested: number } => {
+    const result = {
+      requested: 0,
+      queryPermission: () => Promise.resolve(query),
+      requestPermission: () => {
+        result.requested += 1;
+        return Promise.resolve(request ?? 'denied');
+      },
+    };
+    return result;
+  };
+
+  it('すでに許可されていれば、再要求しない', async () => {
+    const target = handle('granted');
+    await ensureReadWrite(target);
+    expect(target.requested).toBe(0);
+  });
+
+  it('未許可なら再要求し、許可されれば続行する', async () => {
+    const target = handle('prompt', 'granted');
+    await ensureReadWrite(target);
+    expect(target.requested).toBe(1);
+  });
+
+  it('再要求も拒否されたら、例外にする', async () => {
+    await expect(ensureReadWrite(handle('prompt', 'denied'))).rejects.toThrowError('許可されませんでした');
+    await expect(ensureReadWrite(handle('denied'))).rejects.toThrowError('許可されませんでした');
+  });
+
+  it('権限を確認する手段が無い環境では、何もしない', async () => {
+    await expect(ensureReadWrite({})).resolves.toBeUndefined();
+  });
+});

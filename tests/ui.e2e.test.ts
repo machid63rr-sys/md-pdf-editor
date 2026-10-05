@@ -1,0 +1,374 @@
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import type { Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import puppeteer, { type Browser, type Page } from 'puppeteer-core';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { createApp } from '../src/server/app.js';
+import { createPdfRenderer } from '../src/server/pdf.js';
+
+/*
+ * 画面全体の結合テスト。ビルド済みクライアント(dist/client)を実サーバ・実Chromiumで動かし、
+ * 「取り込み → 書式付き編集 → Markdownタブ → 出力」を操作する。
+ * ヘッドレスではネイティブのフォルダ選択ダイアログを操作できないため、ダイアログ(showDirectoryPicker)だけを
+ * ブラウザ標準のオリジン私有ファイルシステム(OPFS)のハンドルを返す関数に差し替える。
+ * ファイルの存在確認・書き込み・上書きは、本物のFile System Access APIで行われる。
+ * 事前に `npm run build` が必要(無ければ、わかりやすいメッセージで失敗する)。
+ * 環境変数 E2E_SCREENSHOT_DIR を指定すると、各画面のスクリーンショットを保存する。
+ */
+const root = fileURLToPath(new URL('..', import.meta.url));
+const clientDir = join(root, 'dist/client');
+const css = readFileSync(join(root, 'src/shared/document.css'), 'utf8');
+const screenshotDir = process.env['E2E_SCREENSHOT_DIR'];
+
+let browser: Browser;
+let server: Server;
+let baseUrl: string;
+let page: Page;
+const consoleErrors: string[] = [];
+
+beforeAll(async () => {
+  if (!existsSync(join(clientDir, 'index.html'))) {
+    throw new Error('dist/client がありません。先に `npm run build` を実行してください。');
+  }
+  const renderer = createPdfRenderer({ chromiumPath: process.env['CHROMIUM_PATH'] ?? '/usr/bin/chromium', timeoutMs: 60_000 });
+  const app = createApp({ maxMarkdownBytes: 5 * 1024 * 1024, renderer, css, clientDir, chromiumVersion: 'e2e' });
+  await new Promise<void>((resolve) => {
+    server = app.listen(0, '127.0.0.1', () => resolve());
+  });
+  baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  browser = await puppeteer.launch({
+    executablePath: process.env['CHROMIUM_PATH'] ?? '/usr/bin/chromium',
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'],
+    // ロケール未設定(Cロケール)のコンテナでは、Chromiumが日本語のファイル名を保存できず「download」になる。
+    // 利用者のブラウザ(Windows等)では起きないため、検証用のChromiumだけUTF-8ロケールで起動する
+    env: { ...process.env, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' },
+  });
+  if (screenshotDir !== undefined) {
+    mkdirSync(screenshotDir, { recursive: true });
+  }
+});
+
+afterAll(async () => {
+  await browser?.close();
+  await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+});
+
+beforeEach(async () => {
+  page = await browser.newPage();
+  await page.setViewport({ width: 1100, height: 1000 });
+  consoleErrors.length = 0;
+  page.on('console', (message) => {
+    if (message.type() === 'error') {
+      consoleErrors.push(message.text());
+    }
+  });
+  page.on('pageerror', (error) => consoleErrors.push(String(error)));
+  // フォルダ選択ダイアログの代わりに、OPFSのルートを「選ばれたフォルダ」として返す(中身は毎回空にする)
+  await page.evaluateOnNewDocument(() => {
+    window.showDirectoryPicker = async () => {
+      const dir = await navigator.storage.getDirectory();
+      for await (const name of (dir as unknown as { keys(): AsyncIterable<string> }).keys()) {
+        await dir.removeEntry(name, { recursive: true });
+      }
+      return dir;
+    };
+  });
+  page.on('dialog', (dialog) => void dialog.accept());
+});
+
+const shot = async (name: string): Promise<void> => {
+  if (screenshotDir !== undefined) {
+    await page.screenshot({ path: join(screenshotDir, `${name}.png`), fullPage: true });
+  }
+};
+
+const SAMPLE = [
+  '# 取扱説明書',
+  '',
+  '画面に <エラー一覧表> と表示されます。型は `List<string>` のようにも書きます。',
+  '',
+  '| 項目 | 説明 |',
+  '| --- | --- |',
+  '| A | 最初の項目 |',
+  '',
+  '```python',
+  'print("こんにちは")',
+  '```',
+].join('\n');
+
+// textareaへ長い文字列を入れるには、1文字ずつ入力せず値を直接設定してinputイベントを発火させる
+async function setPasted(markdown: string): Promise<void> {
+  await page.goto(baseUrl);
+  await page.waitForSelector('#paste-area');
+  await page.$eval(
+    '#paste-area',
+    (element, value) => {
+      const area = element as HTMLTextAreaElement;
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+      setter?.call(area, value);
+      area.dispatchEvent(new Event('input', { bubbles: true }));
+    },
+    markdown,
+  );
+}
+
+const clickButton = async (label: string): Promise<void> => {
+  const handle = await page.evaluateHandle((text) => {
+    return [...document.querySelectorAll('button')].find((button) => button.textContent?.includes(text)) ?? null;
+  }, label);
+  const element = handle.asElement();
+  if (element === null) {
+    throw new Error(`ボタン「${label}」が見つかりません`);
+  }
+  await (element as unknown as { click(): Promise<void> }).click();
+};
+
+const sourceValue = (): Promise<string> =>
+  page.$eval('textarea[aria-label="Markdown"]', (element) => (element as HTMLTextAreaElement).value);
+
+async function loadMarkdown(markdown: string): Promise<void> {
+  await setPasted(markdown);
+  await shot('1-import');
+  await clickButton('貼り付けた内容を読み込む');
+}
+
+async function openEditor(markdown: string): Promise<void> {
+  await loadMarkdown(markdown);
+  await page.waitForSelector('.md-editor-content');
+}
+
+describe('画面操作(実ブラウザ)', () => {
+  it('取り込むと、書式付きプレビューに見出し・表・コードが描画され、解釈エラーにならない', async () => {
+    await openEditor(SAMPLE);
+    await page.waitForFunction(() => document.querySelector('.md-editor-content h1') !== null);
+
+    const text = await page.$eval('.md-editor-content', (element) => (element as HTMLElement).innerText);
+    expect(text).toContain('取扱説明書');
+    expect(text).toContain('<エラー一覧表>');
+    expect(text).toContain('List<string>');
+    expect(text).not.toContain('\\<');
+    expect(await page.$('.md-editor-content table')).not.toBeNull();
+    expect(await page.$('[role="alert"]')).toBeNull();
+    await shot('2-edit-rich');
+    expect(consoleErrors).toEqual([]);
+  });
+
+  it('編集しなければMarkdownは取り込んだままで、Markdownタブにそのまま表示される', async () => {
+    await openEditor(SAMPLE);
+    await clickButton('Markdown');
+    expect(await sourceValue()).toBe(SAMPLE);
+  });
+
+  it('書式付きで編集すると、山括弧とインラインコードが壊れずにMarkdownへ反映される', async () => {
+    await openEditor(SAMPLE);
+    await page.click('.md-editor-content h1');
+    await page.keyboard.press('End');
+    await page.keyboard.type('(第2版)');
+    await clickButton('Markdown');
+
+    const edited = await sourceValue();
+    expect(edited).toContain('# 取扱説明書(第2版)');
+    expect(edited).toContain('<エラー一覧表>');
+    expect(edited).toContain('`List<string>`');
+    expect(edited).not.toContain('\\<');
+    expect(edited).toContain('```python');
+    expect(edited).toMatch(/\| 項目\s*\| 説明\s*\|/);
+    await shot('3-edit-source');
+  });
+
+  it('Markdownタブでの編集が、書式付きプレビューへ反映される', async () => {
+    await openEditor(SAMPLE);
+    await clickButton('Markdown');
+    await page.$eval('textarea[aria-label="Markdown"]', (element) => {
+      const area = element as HTMLTextAreaElement;
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+      setter?.call(area, `${area.value}\n\n## 追記した見出し`);
+      area.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await clickButton('プレビュー');
+    await page.waitForFunction(() =>
+      [...document.querySelectorAll('.md-editor-content h2')].some((h) => h.textContent === '追記した見出し'),
+    );
+  });
+
+  it('脚注を含むMarkdownは、書式付きでは扱えない旨を表示してMarkdownタブへ切り替わる(黙って壊さない)', async () => {
+    await loadMarkdown('本文[^1]\n\n[^1]: 脚注');
+    await page.waitForSelector('[role="alert"]');
+    const alertText = await page.$eval('[role="alert"]', (element) => (element as HTMLElement).innerText);
+    expect(alertText).toContain('書式付きエディタで扱えない記法');
+    expect(await sourceValue()).toBe('本文[^1]\n\n[^1]: 脚注');
+    await shot('4-parse-error');
+  });
+
+  it('生HTML・外部画像・front matterの警告が表示される', async () => {
+    await openEditor('---\ntitle: T\n---\n\n改行<br>です\n\n![図](https://example.com/a.png)');
+    await page.waitForSelector('.warning-list');
+    const warnings = await page.$eval('.warning-list', (element) => (element as HTMLElement).innerText);
+    expect(warnings).toContain('front matter');
+    expect(warnings).toContain('HTMLタグ');
+    expect(warnings).toContain('data URI以外の画像');
+    await shot('5-warnings');
+  });
+
+  describe('出力', () => {
+    const outputButton = (): Promise<boolean> =>
+      page.evaluate(() => {
+        const button = [...document.querySelectorAll('button')].find((b) => b.textContent?.includes('選んだフォルダへMDとPDFを出力'));
+        return button?.disabled ?? true;
+      });
+
+    const readOutputs = (): Promise<{ names: string[]; markdown: string; pdfHeader: string; pdfSize: number }> =>
+      page.evaluate(async () => {
+        const dir = await navigator.storage.getDirectory();
+        const names: string[] = [];
+        for await (const name of (dir as unknown as { keys(): AsyncIterable<string> }).keys()) {
+          names.push(name);
+        }
+        names.sort();
+        const mdFile = await (await dir.getFileHandle('manual.md')).getFile();
+        const pdfFile = await (await dir.getFileHandle('manual.pdf')).getFile();
+        const header = new TextDecoder('latin1').decode((await pdfFile.arrayBuffer()).slice(0, 5));
+        return { names, markdown: await mdFile.text(), pdfHeader: header, pdfSize: pdfFile.size };
+      });
+
+    it('フォルダを選ぶまで出力ボタンは無効。選ぶとMDとPDFが同じ名前で書き込まれる', async () => {
+      await openEditor(SAMPLE);
+      await page.$eval('#base-name', (element) => {
+        const input = element as HTMLInputElement;
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+        setter?.call(input, 'manual');
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      expect(await outputButton()).toBe(true);
+
+      await clickButton('出力先フォルダを選択');
+      await page.waitForFunction(() => !([...document.querySelectorAll('button')].find((b) => b.textContent?.includes('選んだフォルダへMDとPDFを出力'))?.disabled ?? true));
+      await clickButton('選んだフォルダへMDとPDFを出力');
+      await page.waitForSelector('.notice-success', { timeout: 60_000 });
+
+      const status = await page.$eval('.notice-success', (element) => (element as HTMLElement).innerText);
+      expect(status).toContain('manual.md');
+      expect(status).toContain('manual.pdf');
+      const outputs = await readOutputs();
+      expect(outputs.names).toEqual(['manual.md', 'manual.pdf']);
+      expect(outputs.markdown).toBe(SAMPLE);
+      expect(outputs.pdfHeader).toBe('%PDF-');
+      expect(outputs.pdfSize).toBeGreaterThan(1000);
+      await shot('6-output-success');
+      expect(consoleErrors).toEqual([]);
+    });
+
+    it('ファイル名に使えない文字があると、理由を表示して出力できない', async () => {
+      await openEditor(SAMPLE);
+      await page.$eval('#base-name', (element) => {
+        const input = element as HTMLInputElement;
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+        setter?.call(input, 'a/b');
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await page.waitForSelector('.field-error');
+      const message = await page.$eval('.field-error', (element) => (element as HTMLElement).innerText);
+      expect(message).toContain('使えません');
+      expect(await outputButton()).toBe(true);
+    });
+  });
+
+  it('showDirectoryPickerが無いブラウザでは、出力ボタンを無効にして理由を表示する', async () => {
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(window, 'showDirectoryPicker', { value: undefined, configurable: true });
+    });
+    await openEditor(SAMPLE);
+    const reason = await page.$eval('.field-error', (element) => (element as HTMLElement).innerText);
+    expect(reason).toContain('Chrome または Edge');
+  });
+
+  describe('ダウンロードで保存', () => {
+    let downloadDir: string;
+
+    beforeEach(() => {
+      downloadDir = mkdtempSync(join(tmpdir(), 'md-pdf-editor-download-'));
+    });
+
+    const allowDownloads = async (): Promise<void> => {
+      const client = await page.createCDPSession();
+      await client.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: downloadDir });
+    };
+
+    const waitForFiles = async (names: string[]): Promise<void> => {
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline) {
+        const present = readdirSync(downloadDir);
+        if (names.every((name) => present.includes(name) && statSync(join(downloadDir, name)).size > 0)) {
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      throw new Error(`ダウンロードされませんでした: ${names.join(', ')} (実際: ${readdirSync(downloadDir).join(', ')})`);
+    };
+
+    it('フォルダを選ばなくても、MDとPDFの両方がダウンロードされる(内容も正しい)', async () => {
+      await allowDownloads();
+      await openEditor(SAMPLE);
+      await page.$eval('#base-name', (element) => {
+        const input = element as HTMLInputElement;
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+        setter?.call(input, '手順書');
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+
+      await clickButton('ダウンロードで保存');
+      await waitForFiles(['手順書.md', '手順書.pdf']);
+
+      expect(readFileSync(join(downloadDir, '手順書.md'), 'utf8')).toBe(SAMPLE);
+      expect(readFileSync(join(downloadDir, '手順書.pdf')).subarray(0, 5).toString('latin1')).toBe('%PDF-');
+      const status = await page.$eval('.notice-success', (element) => (element as HTMLElement).innerText);
+      expect(status).toContain('手順書.md');
+      expect(status).toContain('手順書.pdf');
+      rmSync(downloadDir, { recursive: true, force: true });
+    });
+
+    it('フォルダ選択に対応していないブラウザでも、ダウンロードで保存できる', async () => {
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(window, 'showDirectoryPicker', { value: undefined, configurable: true });
+      });
+      await allowDownloads();
+      await openEditor(SAMPLE);
+      const reason = await page.$eval('.field-error', (element) => (element as HTMLElement).innerText);
+      expect(reason).toContain('ダウンロードで保存');
+
+      await clickButton('ダウンロードで保存');
+      await waitForFiles(['document.md', 'document.pdf']);
+      rmSync(downloadDir, { recursive: true, force: true });
+    });
+
+    it('ファイル名が不正なときは、ダウンロードできない', async () => {
+      await openEditor(SAMPLE);
+      await page.$eval('#base-name', (element) => {
+        const input = element as HTMLInputElement;
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+        setter?.call(input, 'a/b');
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      const disabled = await page.evaluate(
+        () => [...document.querySelectorAll('button')].find((b) => b.textContent?.includes('ダウンロードで保存'))?.disabled,
+      );
+      expect(disabled).toBe(true);
+    });
+  });
+
+  it('「PDFを生成して確認」でPDFが新しいタブに開く', async () => {
+    await openEditor(SAMPLE);
+    const popupPromise = new Promise<Page>((resolve) => {
+      browser.once('targetcreated', (target) => void target.page().then((created) => resolve(created as Page)));
+    });
+    await clickButton('PDFを生成して確認');
+    const popup = await popupPromise;
+    await popup.waitForFunction(() => location.href.startsWith('blob:'), { timeout: 60_000 });
+    expect(popup.url()).toMatch(/^blob:http:\/\/127\.0\.0\.1:\d+\//);
+    await popup.close();
+  });
+});
