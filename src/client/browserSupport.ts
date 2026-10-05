@@ -1,29 +1,37 @@
-export interface DirectoryPickerEnvironment {
+export interface PickerEnvironment {
   readonly isSecureContext: boolean;
   readonly showDirectoryPicker?: unknown;
+  readonly showSaveFilePicker?: unknown;
 }
 
-export type DirectoryPickerSupport =
+export type PickerSupport =
   | { readonly supported: true }
   | { readonly supported: false; readonly reason: string };
 
-/**
- * フォルダ選択(File System Access API)が使えるかを判定する。
+/*
+ * File System Access API が使えるかを判定する。
  * 使えない場合は、ダウンロード等へ黙って切り替えず、理由を利用者に示す。
  */
-export function checkDirectoryPickerSupport(env: DirectoryPickerEnvironment): DirectoryPickerSupport {
+function checkSupport(env: PickerEnvironment, api: unknown, feature: string): PickerSupport {
   if (!env.isSecureContext) {
     return {
       supported: false,
-      reason:
-        'この接続(http://IPアドレスなど)ではフォルダへの直接出力を利用できません。http://localhost:ポート番号 でアクセスしてください。',
+      reason: `この接続(http://IPアドレスなど)では${feature}を利用できません。http://localhost:ポート番号 でアクセスしてください。`,
     };
   }
-  if (typeof env.showDirectoryPicker !== 'function') {
+  if (typeof api !== 'function') {
     return {
       supported: false,
-      reason: 'このブラウザはフォルダへの直接出力に対応していません。Chrome または Edge をお使いください。',
+      reason: `このブラウザは${feature}に対応していません。Chrome または Edge をお使いください。`,
     };
   }
   return { supported: true };
 }
+
+/** 「フォルダを選んで、そこへ書き込む」が使えるか */
+export const checkDirectoryPickerSupport = (env: PickerEnvironment): PickerSupport =>
+  checkSupport(env, env.showDirectoryPicker, 'フォルダへの直接出力');
+
+/** 「名前を付けて保存」ダイアログが使えるか */
+export const checkSaveFilePickerSupport = (env: PickerEnvironment): PickerSupport =>
+  checkSupport(env, env.showSaveFilePicker, '「名前を付けて保存」ダイアログ');

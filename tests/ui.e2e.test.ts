@@ -77,6 +77,22 @@ beforeEach(async () => {
       return dir;
     };
   });
+  // 「名前を付けて保存」ダイアログの代わりに、OPFSに提案名のファイルを新規作成して返す。
+  // window.__cancelSave を true にすると、利用者がダイアログを閉じた場合(AbortError)を再現する
+  await page.evaluateOnNewDocument(() => {
+    (window as unknown as { showSaveFilePicker: unknown }).showSaveFilePicker = async (options: { suggestedName: string }) => {
+      if ((window as unknown as { __cancelSave?: boolean }).__cancelSave === true) {
+        throw new DOMException('The user aborted a request.', 'AbortError');
+      }
+      const dir = await navigator.storage.getDirectory();
+      try {
+        await dir.removeEntry(options.suggestedName);
+      } catch {
+        // まだ存在しない場合は何もしない
+      }
+      return dir.getFileHandle(options.suggestedName, { create: true });
+    };
+  });
   page.on('dialog', (dialog) => void dialog.accept());
 });
 
@@ -284,6 +300,182 @@ describe('画面操作(実ブラウザ)', () => {
     await openEditor(SAMPLE);
     const reason = await page.$eval('.field-error', (element) => (element as HTMLElement).innerText);
     expect(reason).toContain('Chrome または Edge');
+  });
+
+  describe('保存するファイルの選択(チェックボックス)', () => {
+    const state = (): Promise<{
+      name: { disabled: boolean };
+      folder: boolean;
+      primary: string;
+      primaryDisabled: boolean;
+      download: boolean;
+      hint: string;
+    }> =>
+      page.evaluate(() => {
+        const buttons = [...document.querySelectorAll('button')];
+        const find = (text: string) => buttons.find((b) => b.textContent?.includes(text));
+        const primary = document.querySelector('.actions .button-primary') as HTMLButtonElement;
+        return {
+          name: { disabled: (document.getElementById('base-name') as HTMLInputElement).disabled },
+          folder: find('出力先フォルダを選択')?.disabled ?? true,
+          primary: primary.textContent ?? '',
+          primaryDisabled: primary.disabled,
+          download: find('ダウンロードで保存')?.disabled ?? true,
+          hint: (document.querySelector('.output-panel') as HTMLElement).innerText,
+        };
+      });
+
+    // ブラウザ内の保存先(OPFS)は、テストをまたいで残るため、毎回空にして「保存されていないこと」を検証できるようにする
+    beforeEach(async () => {
+      await page.goto(baseUrl);
+      await page.evaluate(async () => {
+        const dir = await navigator.storage.getDirectory();
+        for await (const name of (dir as unknown as { keys(): AsyncIterable<string> }).keys()) {
+          await dir.removeEntry(name, { recursive: true });
+        }
+      });
+    });
+
+    const setChecked = async (label: string, checked: boolean): Promise<void> => {
+      await page.evaluate(
+        (text, value) => {
+          const input = [...document.querySelectorAll('.file-select label')]
+            .find((l) => l.textContent?.includes(text))
+            ?.querySelector('input') as HTMLInputElement;
+          if (input.checked !== value) {
+            input.click();
+          }
+        },
+        label,
+        checked,
+      );
+    };
+
+    const savedFile = (name: string): Promise<{ text: string; header: string } | null> =>
+      page.evaluate(async (fileName) => {
+        const dir = await navigator.storage.getDirectory();
+        try {
+          const file = await (await dir.getFileHandle(fileName)).getFile();
+          return { text: await file.text(), header: new TextDecoder('latin1').decode((await file.arrayBuffer()).slice(0, 5)) };
+        } catch {
+          return null;
+        }
+      }, name);
+
+    it('初期状態は両方チェック。ファイル名を編集でき、フォルダを選んでまとめて出力する', async () => {
+      await openEditor(SAMPLE);
+      const initial = await state();
+      expect(initial.name.disabled).toBe(false);
+      expect(initial.folder).toBe(false);
+      expect(initial.primary).toBe('選んだフォルダへMDとPDFを出力');
+      expect(initial.download).toBe(false);
+      await shot('7-select-both');
+    });
+
+    it.each([
+      ['Markdown (.md)', 'PDF (.pdf)', '名前を付けてPDFを保存…'],
+      ['PDF (.pdf)', 'Markdown (.md)', '名前を付けてMDを保存…'],
+    ])('%s を外すと(%sだけ保存)、ファイル名欄・フォルダ選択・ダウンロードがグレーになり、名前を付けて保存に切り替わる', async (unchecked, _kept, expectedLabel) => {
+      await openEditor(SAMPLE);
+      await setChecked(unchecked, false);
+
+      const single = await state();
+      expect(single.name.disabled).toBe(true);
+      expect(single.folder).toBe(true);
+      expect(single.download).toBe(true);
+      expect(single.primary).toBe(expectedLabel);
+      expect(single.primaryDisabled).toBe(false);
+      expect(single.hint).toContain('名前を付けて保存」のダイアログで指定します');
+      await shot('8-select-single');
+
+      // 両方に戻すと、元の状態に戻る
+      await setChecked(unchecked, true);
+      const both = await state();
+      expect(both.name.disabled).toBe(false);
+      expect(both.folder).toBe(false);
+      expect(both.primary).toBe('選んだフォルダへMDとPDFを出力');
+    });
+
+    it('両方外すと、保存系のボタンはすべて無効になり、選ぶよう促す', async () => {
+      await openEditor(SAMPLE);
+      await setChecked('Markdown (.md)', false);
+      await setChecked('PDF (.pdf)', false);
+
+      const none = await state();
+      expect(none.name.disabled).toBe(true);
+      expect(none.folder).toBe(true);
+      expect(none.primaryDisabled).toBe(true);
+      expect(none.download).toBe(true);
+      expect(none.hint).toContain('保存するファイルを1つ以上選んでください');
+    });
+
+    it('PDFだけ保存: ダイアログの提案名は「<名前>.pdf」。ダイアログで保存先が決まった後にPDFが書き込まれる', async () => {
+      await openEditor(SAMPLE);
+      await setChecked('Markdown (.md)', false);
+      await clickButton('名前を付けてPDFを保存');
+      await page.waitForSelector('.notice-success', { timeout: 60_000 });
+
+      const status = await page.$eval('.notice-success', (element) => (element as HTMLElement).innerText);
+      expect(status).toContain('document.pdf');
+      const pdf = await savedFile('document.pdf');
+      expect(pdf?.header).toBe('%PDF-');
+      expect(await savedFile('document.md')).toBeNull();
+      await shot('9-save-pdf-only');
+      expect(consoleErrors).toEqual([]);
+    });
+
+    it('Markdownだけ保存: 編集した内容がそのまま書き込まれる', async () => {
+      await openEditor(SAMPLE);
+      await setChecked('PDF (.pdf)', false);
+      await clickButton('名前を付けてMDを保存');
+      await page.waitForSelector('.notice-success');
+
+      expect((await savedFile('document.md'))?.text).toBe(SAMPLE);
+      expect(await savedFile('document.pdf')).toBeNull();
+    });
+
+    it('ダイアログを閉じた(中止した)場合は、何も保存せず、エラーも出さない', async () => {
+      await openEditor(SAMPLE);
+      await setChecked('Markdown (.md)', false);
+      await page.evaluate(() => {
+        (window as unknown as { __cancelSave: boolean }).__cancelSave = true;
+      });
+      await clickButton('名前を付けてPDFを保存');
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      expect(await page.$('[role="alert"]')).toBeNull();
+      expect(await page.$('.notice-success')).toBeNull();
+      expect(await savedFile('document.pdf')).toBeNull();
+      // 中止の後も、続けて操作できる
+      const after = await state();
+      expect(after.primaryDisabled).toBe(false);
+    });
+
+    it('「名前を付けて保存」に対応していないブラウザで1つだけ保存する場合は、ファイル名を編集でき、ダウンロードで保存する', async () => {
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(window, 'showSaveFilePicker', { value: undefined, configurable: true });
+      });
+      const downloads = mkdtempSync(join(tmpdir(), 'md-pdf-editor-single-'));
+      const client = await page.createCDPSession();
+      await client.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: downloads });
+      await openEditor(SAMPLE);
+      await setChecked('PDF (.pdf)', false);
+
+      const single = await state();
+      expect(single.name.disabled).toBe(false);
+      expect(single.download).toBe(false);
+      expect(single.primaryDisabled).toBe(true);
+
+      await clickButton('ダウンロードで保存');
+      await page.waitForSelector('.notice-success');
+      const deadline = Date.now() + 30_000;
+      while (!readdirSync(downloads).includes('document.md') && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      expect(readdirSync(downloads).sort()).toEqual(['document.md']);
+      expect(readFileSync(join(downloads, 'document.md'), 'utf8')).toBe(SAMPLE);
+      rmSync(downloads, { recursive: true, force: true });
+    });
   });
 
   describe('ダウンロードで保存', () => {

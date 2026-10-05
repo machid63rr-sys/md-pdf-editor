@@ -234,6 +234,27 @@ body {
 .text-input[aria-invalid='true'] {
   border-color: #dc2626;
 }
+/* 使えない入力欄は、触れないことが見た目で分かるようにグレーにする */
+.text-input:disabled {
+  background: #f3f4f6;
+  color: var(--muted);
+  cursor: not-allowed;
+}
+.file-select {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  gap: 16px;
+}
+.file-select legend {
+  float: left;
+  min-width: 11em;
+  padding: 0;
+}
+.file-select label {
+  min-width: 0;
+  cursor: pointer;
+}
 .field-suffix,
 .field-value {
   color: var(--muted);
