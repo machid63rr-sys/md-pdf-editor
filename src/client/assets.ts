@@ -38,7 +38,7 @@ export function imageMimeOf(path: string): string | undefined {
 export const isImagePath = (path: string): boolean => imageMimeOf(path) !== undefined;
 
 // 大きなバッファでも、引数の数の上限に当たらないよう、少しずつ文字列にする
-function toBase64(buffer: ArrayBuffer): string {
+export function toBase64(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
   const CHUNK = 0x8000;
   let binary = '';

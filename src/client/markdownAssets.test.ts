@@ -14,6 +14,12 @@ describe('collectMarkdownAssets', () => {
     expect(store.dataUri('docs/img/unused.png')).toBeUndefined();
   });
 
+  it('大きさを指定した画像(<img>のタグ)が指す、取り込んだ画像も読み込む', async () => {
+    const store = new AssetStore([file('docs/img/a.png')], true);
+    const result = await collectMarkdownAssets('本文<img src="img/a.png" width="300" height="166" />', 'docs', store);
+    expect(result).toEqual({ 'docs/img/a.png': URI });
+  });
+
   it('参照形式の定義・相対の書き方(../ や ./)も、解決したパスをキーにする', async () => {
     const store = new AssetStore([file('shared/b.png')], true);
     const result = await collectMarkdownAssets('![図][b]\n\n[b]: ../shared/b.png', 'docs', store);

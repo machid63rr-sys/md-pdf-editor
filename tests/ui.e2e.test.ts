@@ -6,7 +6,7 @@ import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer, { type Browser, type ElementHandle, type Frame, type Page } from 'puppeteer-core';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createApp } from '../src/server/app.js';
 import { createPdfRenderer } from '../src/server/pdf.js';
 
@@ -1428,5 +1428,359 @@ describe('コードブロックの色分けとMermaidの図(実ブラウザ)', (
       expect(text, label).toContain(label);
     }
     expect(text).not.toContain('graph TD');
+  });
+});
+
+describe('画像のドラッグ&ドロップによる埋め込み(実ブラウザ)', () => {
+  const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  const HTML_PAGE = '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="utf-8">\n<title>t</title>\n</head>\n<body>\n<h1>見出し</h1>\n<p>本文です。</p>\n</body>\n</html>\n';
+  const DATA_PNG = /data:image\/png;base64,[A-Za-z0-9+/=]+/;
+  let dir: string;
+  const path = (name: string): string => join(dir, name);
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'md-pdf-editor-embed-'));
+    writeFileSync(path('a.png'), Buffer.from(PNG, 'base64'));
+    writeFileSync(path('b.txt'), 'テキスト');
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  // 実際のファイルを、指定の位置へドロップする(ブラウザのドラッグ&ドロップそのもの)
+  const dropAt = async (x: number, y: number, ...paths: string[]): Promise<void> => {
+    const client = await page.createCDPSession();
+    const data = { items: [], files: paths, dragOperationsMask: 1 };
+    for (const type of ['dragEnter', 'dragOver', 'drop'] as const) {
+      await client.send('Input.dispatchDragEvent', { type, x, y, data });
+    }
+    await client.detach();
+  };
+
+  const boxOf = async (handle: ElementHandle<Element> | null): Promise<{ x: number; y: number; width: number; height: number }> => {
+    const box = await handle?.boundingBox();
+    if (box === null || box === undefined) {
+      throw new Error('ドロップ先の要素が見つかりません');
+    }
+    return box;
+  };
+
+  const dropOnCenter = async (handle: ElementHandle<Element> | null, ...paths: string[]): Promise<void> => {
+    const box = await boxOf(handle);
+    await dropAt(box.x + box.width / 2, box.y + box.height / 2, ...paths);
+  };
+
+  const noticeText = (): Promise<string> =>
+    page.$eval('.notice-info[role="status"], .notice-error[role="alert"]', (element) => (element as HTMLElement).innerText);
+
+  const setCaret = (selector: string, offset: number): Promise<void> =>
+    page.$eval(
+      selector,
+      (element, position) => {
+        const area = element as HTMLTextAreaElement;
+        area.focus();
+        area.setSelectionRange(position, position);
+      },
+      offset,
+    );
+
+  const textareaState = (selector: string): Promise<{ value: string; caret: number }> =>
+    page.$eval(selector, (element) => ({ value: (element as HTMLTextAreaElement).value, caret: (element as HTMLTextAreaElement).selectionStart }));
+
+  const selectPasteKind = (label: string): Promise<void> =>
+    page.evaluate((text) => {
+      const input = [...document.querySelectorAll('.paste-kind label')].find((l) => l.textContent?.includes(text))?.querySelector('input');
+      (input as HTMLInputElement).click();
+    }, label);
+
+  const openHtml = async (html: string): Promise<Frame> => {
+    await setPasted(html);
+    await selectPasteKind('HTML');
+    await clickButton('貼り付けた内容を読み込む');
+    await page.waitForFunction(
+      () => (document.querySelector('iframe.html-preview-frame') as HTMLIFrameElement | null)?.contentDocument?.designMode === 'on',
+    );
+    return (await (await page.$('iframe.html-preview-frame'))?.contentFrame()) as Frame;
+  };
+
+  const outputPdfImageCount = async (): Promise<number> => {
+    await clickButton('出力先フォルダを選択');
+    await page.waitForFunction(
+      () => !([...document.querySelectorAll('button')].find((b) => b.textContent?.includes('選んだフォルダへ'))?.disabled ?? true),
+    );
+    await clickButton('選んだフォルダへ');
+    await page.waitForSelector('.notice-success', { timeout: 60_000 });
+    const bytes = await page.evaluate(async () => {
+      const root = await navigator.storage.getDirectory();
+      const file = await (await root.getFileHandle('document.pdf')).getFile();
+      return [...new Uint8Array(await file.arrayBuffer())];
+    });
+    const pdf = join(dir, 'out.pdf');
+    writeFileSync(pdf, Buffer.from(bytes));
+    return execFileSync('pdfimages', ['-list', pdf], { encoding: 'utf8' })
+      .split('\n')
+      .filter((line) => /^\s*\d+\s+\d+\s+image\b/.test(line)).length;
+  };
+
+  describe('Markdown(書式付きプレビュー)', () => {
+    it('画像ファイルをドロップすると、画像として埋め込まれ、Markdownとして保存され、PDFにも入る', async () => {
+      await openEditor('# 題\n\n本文です。');
+      await page.waitForSelector('.md-editor-content p');
+      await dropOnCenter(await page.$('.md-editor-content p'), path('a.png'));
+
+      await page.waitForFunction(() => (document.querySelector('.md-editor-content img') as HTMLImageElement | null)?.src.startsWith('data:image/png;base64,'));
+      expect(await noticeText()).toContain('画像「a.png」を埋め込みました');
+      await shot('20-drop-markdown');
+
+      // 画像を表示するだけでなく、Markdownの中に、画像のデータが入る(元の文章は、そのまま)
+      expect(await page.$eval('.md-editor-content img', (element) => (element as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+      expect(await outputPdfImageCount()).toBeGreaterThan(0);
+      await clickButton('Markdown');
+      const markdown = await sourceValue();
+      expect(markdown).toContain('# 題');
+      expect(markdown).toContain('本文です。');
+      expect(markdown).toMatch(/!\[\]\(data:image\/png;base64,[A-Za-z0-9+/=]+\)/);
+      expect(page.url()).toBe(`${baseUrl}/`);
+      expect(consoleErrors).toEqual([]);
+    });
+
+    it('ドロップした位置(どの段落か)に、画像が入る(文書の末尾ではない)', async () => {
+      await openEditor('AAA\n\nBBB\n\nCCC');
+      await page.waitForSelector('.md-editor-content p');
+      const first = (await page.$$('.md-editor-content p'))[0] ?? null;
+      await dropOnCenter(first, path('a.png'));
+      await page.waitForSelector('.md-editor-content img');
+      await clickButton('Markdown');
+      const markdown = await sourceValue();
+      expect(markdown).toMatch(/^AAA!\[\]\(data:image\/png;base64,[A-Za-z0-9+/=]+\)\n\nBBB\n\nCCC$/);
+    });
+
+    it('文の途中にドロップすると、その位置に画像が入り、文が前後に分かれる', async () => {
+      await openEditor('ABCDEFGHIJ');
+      await page.waitForSelector('.md-editor-content p');
+      // 5文字目と6文字目の間の、画面上の位置
+      const point = await page.evaluate(() => {
+        // エディタは、文字を<span>で包むため、文字のノードを探す
+        const text = document.createTreeWalker(document.querySelector('.md-editor-content p') as Element, NodeFilter.SHOW_TEXT).nextNode() as Text;
+        const range = document.createRange();
+        range.setStart(text, 5);
+        range.setEnd(text, 5);
+        const rect = range.getBoundingClientRect();
+        return { x: rect.x, y: rect.y + rect.height / 2 };
+      });
+      await dropAt(point.x, point.y, path('a.png'));
+      await page.waitForSelector('.md-editor-content img');
+      await clickButton('Markdown');
+      expect(await sourceValue()).toMatch(/^ABCDE!\[\]\(data:image\/png;base64,[A-Za-z0-9+/=]+\)FGHIJ$/);
+    });
+
+    it('埋め込んだ画像の大きさを変えると、MarkdownにはHTMLの<img>で書かれるが、警告は出ず、PDFには画像として、変えた大きさで入る', async () => {
+      await openEditor('# 題\n\n本文です。');
+      await page.waitForSelector('.md-editor-content p');
+      // サイズ変更のつまみを操作できるよう、1x1ではない画像を、ブラウザで作る
+      const wide = await page.evaluate(() => {
+        const canvas = document.createElement('canvas');
+        canvas.width = 320;
+        canvas.height = 160;
+        const context = canvas.getContext('2d') as CanvasRenderingContext2D;
+        context.fillStyle = '#2563eb';
+        context.fillRect(0, 0, 320, 160);
+        return canvas.toDataURL('image/png').split(',')[1] as string;
+      });
+      writeFileSync(path('wide.png'), Buffer.from(wide, 'base64'));
+      await dropOnCenter(await page.$('.md-editor-content p'), path('wide.png'));
+      await page.waitForSelector('.md-editor-content img');
+      await page.click('.md-editor-content img');
+      await page.waitForSelector('[class*="imageResizerSe"]');
+      const handle = await page.evaluate(() => {
+        const rect = document.querySelector('[class*="imageResizerSe"]')?.getBoundingClientRect() as DOMRect;
+        return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+      });
+      await page.mouse.move(handle.x, handle.y);
+      await page.mouse.down();
+      await page.mouse.move(handle.x + 40, handle.y + 40, { steps: 6 });
+      await page.mouse.up();
+      await page.waitForFunction(() => document.querySelector('.md-editor-content img')?.getAttribute('width') !== null);
+
+      // エディタは、大きさを変えた画像を、<img>のタグで書き出す
+      await clickButton('Markdown');
+      const markdown = await sourceValue();
+      expect(markdown).toMatch(/<img [^>]*src="data:image\/png;base64,[A-Za-z0-9+/=]+"[^>]*\/>/);
+      expect(markdown).toMatch(/width="\d+/);
+      // 画像として表示されるため、「HTMLタグは文字として表示される」という警告は出ない
+      expect(await page.$('.warning-list')).toBeNull();
+
+      // PDFには、画像が入り、タグの文字は出ない
+      const bytes = await (async () => {
+        await clickButton('出力先フォルダを選択');
+        await page.waitForFunction(
+          () => !([...document.querySelectorAll('button')].find((b) => b.textContent?.includes('選んだフォルダへ'))?.disabled ?? true),
+        );
+        await clickButton('選んだフォルダへ');
+        await page.waitForSelector('.notice-success', { timeout: 60_000 });
+        return page.evaluate(async () => {
+          const root = await navigator.storage.getDirectory();
+          const file = await (await root.getFileHandle('document.pdf')).getFile();
+          return [...new Uint8Array(await file.arrayBuffer())];
+        });
+      })();
+      const pdf = join(dir, 'resized.pdf');
+      writeFileSync(pdf, Buffer.from(bytes));
+      expect(execFileSync('pdfimages', ['-list', pdf], { encoding: 'utf8' }).split('\n').filter((line) => /^\s*\d+\s+\d+\s+image\b/.test(line)).length).toBeGreaterThan(0);
+      const text = execFileSync('pdftotext', [pdf, '-'], { encoding: 'utf8' });
+      expect(text).not.toContain('<img');
+      expect(text).not.toContain('base64');
+      expect(text).toContain('本文です。');
+    });
+
+    it('画像でないファイルをドロップすると、ブラウザがそのファイルを開かず、文書も変わらず、理由が表示される', async () => {
+      const original = '# 題\n\n本文です。';
+      await openEditor(original);
+      await page.waitForSelector('.md-editor-content p');
+      await dropOnCenter(await page.$('.md-editor-content p'), path('b.txt'));
+
+      await page.waitForSelector('.notice-error[role="alert"]');
+      expect(await noticeText()).toContain('「b.txt」は画像として埋め込めません');
+      expect(page.url()).toBe(`${baseUrl}/`);
+      expect(await page.$('.md-editor-content img')).toBeNull();
+      await clickButton('Markdown');
+      expect(await sourceValue()).toBe(original);
+    });
+
+    it('大きすぎる画像は、埋め込まず、理由が表示される', async () => {
+      writeFileSync(path('big.png'), Buffer.alloc(10 * 1024 * 1024 + 1));
+      await openEditor('# 題');
+      await dropOnCenter(await page.$('.md-editor-content h1'), path('big.png'));
+      await page.waitForSelector('.notice-error[role="alert"]');
+      expect(await noticeText()).toContain('「big.png」は大きすぎるため埋め込めません');
+      expect(await page.$('.md-editor-content img')).toBeNull();
+    });
+
+    it('画像と画像でないファイルを一緒にドロップすると、何も埋め込まず、理由が表示される', async () => {
+      await openEditor('# 題');
+      await dropOnCenter(await page.$('.md-editor-content h1'), path('a.png'), path('b.txt'));
+      await page.waitForSelector('.notice-error[role="alert"]');
+      expect(await page.$('.md-editor-content img')).toBeNull();
+    });
+
+    it('クリップボードの画像(スクリーンショットなど)を貼り付けても、埋め込まれる', async () => {
+      await openEditor('# 題\n\n本文です。');
+      await page.click('.md-editor-content p');
+      await page.evaluate((base64) => {
+        const file = new File([Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))], 'image.png', { type: 'image/png' });
+        const clipboardData = new DataTransfer();
+        clipboardData.items.add(file);
+        document.querySelector('.md-editor-content p')?.dispatchEvent(new ClipboardEvent('paste', { clipboardData, bubbles: true, cancelable: true }));
+      }, PNG);
+      await page.waitForFunction(() => (document.querySelector('.md-editor-content img') as HTMLImageElement | null)?.src.startsWith('data:image/png;base64,'));
+      expect(await noticeText()).toContain('画像「image.png」を埋め込みました');
+    });
+  });
+
+  describe('Markdown(ソース)', () => {
+    const SOURCE = 'AAA\nBBB';
+
+    it('画像ファイルをドロップすると、カーソルの位置に、独立した段落として挿入され、カーソルは画像の後ろに移る', async () => {
+      await openEditor(SOURCE);
+      await clickButton('Markdown');
+      await page.waitForSelector('textarea[aria-label="Markdown"]');
+      await setCaret('textarea[aria-label="Markdown"]', 3);
+      await dropOnCenter(await page.$('textarea[aria-label="Markdown"]'), path('a.png'));
+
+      await page.waitForFunction(() => (document.querySelector('textarea[aria-label="Markdown"]') as HTMLTextAreaElement).value.includes('data:image/png'));
+      const { value, caret } = await textareaState('textarea[aria-label="Markdown"]');
+      const image = /!\[a\]\(data:image\/png;base64,[A-Za-z0-9+/=]+\)/.exec(value)?.[0] ?? '';
+      expect(image).not.toBe('');
+      expect(value).toBe(`AAA\n\n${image}\n\nBBB`);
+      expect(caret).toBe(`AAA\n\n${image}`.length);
+      expect(await noticeText()).toContain('画像「a.png」を埋め込みました');
+      expect(page.url()).toBe(`${baseUrl}/`);
+
+      // 書式付きプレビューに戻すと、画像として表示される
+      await clickButton('プレビュー');
+      await page.waitForFunction(() => (document.querySelector('.md-editor-content img') as HTMLImageElement | null)?.naturalWidth! > 0);
+    });
+
+    it('画像でないファイルをドロップしても、ブラウザがそのファイルを開かず、内容も変わらず、理由が表示される', async () => {
+      await openEditor(SOURCE);
+      await clickButton('Markdown');
+      await page.waitForSelector('textarea[aria-label="Markdown"]');
+      await dropOnCenter(await page.$('textarea[aria-label="Markdown"]'), path('b.txt'));
+      await page.waitForSelector('.notice-error[role="alert"]');
+      expect(await noticeText()).toContain('「b.txt」は画像として埋め込めません');
+      expect(page.url()).toBe(`${baseUrl}/`);
+      expect((await textareaState('textarea[aria-label="Markdown"]')).value).toBe(SOURCE);
+    });
+  });
+
+  describe('HTML', () => {
+    it('プレビューへ画像ファイルをドロップすると、ドロップした位置に画像が入り、HTMLには、その画像の分だけが加わる', async () => {
+      const frame = await openHtml(HTML_PAGE);
+      const box = await boxOf(await frame.$('p'));
+      // 文の右側(行末)にドロップする
+      await dropAt(box.x + box.width - 5, box.y + box.height / 2, path('a.png'));
+
+      await frame.waitForSelector('img[src^="data:image/png;base64,"]');
+      expect(await noticeText()).toContain('画像「a.png」を埋め込みました');
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await shot('21-drop-html-preview');
+
+      await clickButton('HTML');
+      await page.waitForSelector('textarea[aria-label="HTML"]');
+      const { value } = await textareaState('textarea[aria-label="HTML"]');
+      expect(value).toMatch(new RegExp(`<img src="${DATA_PNG.source}" alt="a">`));
+      // 加わったのは画像だけ。それ以外のHTMLは、取り込んだままである
+      expect(value.replace(new RegExp(`<img src="${DATA_PNG.source}" alt="a">`), '')).toBe(HTML_PAGE);
+      expect(page.url()).toBe(`${baseUrl}/`);
+    });
+
+    it('画像でないファイルをプレビューへドロップしても、プレビューは別の文書に切り替わらず、理由が表示される', async () => {
+      const frame = await openHtml(HTML_PAGE);
+      await dropOnCenter(await frame.$('p'), path('b.txt'));
+      await page.waitForSelector('.notice-error[role="alert"]');
+      expect(await noticeText()).toContain('「b.txt」は画像として埋め込めません');
+      expect(await frame.$('h1')).not.toBeNull();
+      await clickButton('HTML');
+      expect((await textareaState('textarea[aria-label="HTML"]')).value).toBe(HTML_PAGE);
+    });
+
+    it('HTMLタブへドロップすると、カーソルの位置に <img> が挿入され、隣の読み取り専用のプレビューにも表示される。プレビューは、別の文書に切り替わらない', async () => {
+      await openHtml(HTML_PAGE);
+      await clickButton('HTML');
+      await page.waitForSelector('textarea[aria-label="HTML"]');
+      const position = HTML_PAGE.indexOf('<p>');
+      await setCaret('textarea[aria-label="HTML"]', position);
+      await dropOnCenter(await page.$('textarea[aria-label="HTML"]'), path('a.png'));
+
+      await page.waitForFunction(() => (document.querySelector('textarea[aria-label="HTML"]') as HTMLTextAreaElement).value.includes('<img src="data:image/png'));
+      const { value, caret } = await textareaState('textarea[aria-label="HTML"]');
+      const tag = new RegExp(`<img src="${DATA_PNG.source}" alt="a">`).exec(value)?.[0] ?? '';
+      expect(value).toBe(HTML_PAGE.slice(0, position) + tag + HTML_PAGE.slice(position));
+      expect(caret).toBe(position + tag.length);
+
+      const side = (await (await page.$('iframe.html-preview-frame'))?.contentFrame()) as Frame;
+      await side.waitForSelector('img[src^="data:image/png"]');
+
+      // 読み取り専用のプレビューへのドロップでも、プレビューは、別の文書に切り替わらない
+      await dropOnCenter(await page.$('iframe.html-preview-frame'), path('b.txt'));
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(page.url()).toBe(`${baseUrl}/`);
+      expect(await side.$('h1')).not.toBeNull();
+    });
+
+    it('CSSタブへドロップすると、カーソルの位置に url("data:…") が挿入される', async () => {
+      writeFileSync(path('index.html'), '<!DOCTYPE html>\n<html>\n<head>\n<link rel="stylesheet" href="style.css">\n</head>\n<body>\n<p>本文</p>\n</body>\n</html>\n');
+      writeFileSync(path('style.css'), 'body { background: red; }\n');
+      await page.goto(baseUrl);
+      await page.waitForSelector('input[type=file]', { hidden: true });
+      await ((await page.$('input[type=file]')) as ElementHandle<HTMLInputElement>).uploadFile(path('index.html'), path('style.css'));
+      await page.waitForFunction(() => [...document.querySelectorAll('.tab')].some((tab) => tab.textContent === 'CSS: style.css'));
+      await clickButton('CSS: style.css');
+      await page.waitForSelector('textarea[aria-label="CSS: style.css"]');
+      await setCaret('textarea[aria-label="CSS: style.css"]', 'body { background: '.length);
+      await dropOnCenter(await page.$('textarea[aria-label="CSS: style.css"]'), path('a.png'));
+
+      await page.waitForFunction(() => (document.querySelector('textarea[aria-label="CSS: style.css"]') as HTMLTextAreaElement).value.includes('url("data:image/png'));
+      const { value } = await textareaState('textarea[aria-label="CSS: style.css"]');
+      expect(value).toMatch(new RegExp(`^body \\{ background: url\\("${DATA_PNG.source}"\\)red; \\}\\n$`));
+    });
   });
 });

@@ -26,6 +26,37 @@ describe('lintMarkdown', () => {
     });
   });
 
+  describe('画像の<img>タグ(エディタで大きさを変えた画像)', () => {
+    const tag = (src: string): string => `本文<img height="166" width="300" src="${src}" />`;
+
+    it('画像として表示されるため、HTMLタグの警告は出ない(data URI)', () => {
+      expect(codes(tag('data:image/png;base64,iVBORw=='))).toEqual([]);
+    });
+
+    it('取り込んだ画像を指していれば、警告は出ない', () => {
+      expect(lintMarkdown(tag('images/a.png'), (reference) => reference === 'images/a.png')).toEqual([]);
+    });
+
+    it('表示できない画像(外部URL・取り込んだ中に無いもの)は、画像の警告になる(HTMLタグの警告にはならない)', () => {
+      expect(codes(tag('https://example.com/a.png'))).toEqual(['unsupported-image']);
+      expect(codes(tag('images/none.png'))).toEqual(['unsupported-image']);
+    });
+
+    it('画像として読めないHTMLタグ(srcなし・ほかのタグ)は、これまでどおり、HTMLタグの警告になる', () => {
+      expect(codes('<img alt="x">')).toEqual(['raw-html']);
+      expect(codes('<p><img src="data:image/png;base64,AA=="></p>')).toEqual(['raw-html']);
+    });
+
+    it('画像の<img>と、ほかのHTMLタグが同じ行にあれば、HTMLタグの警告は出る', () => {
+      expect(codes('改行<br>' + tag('data:image/png;base64,AA=='))).toEqual(['raw-html']);
+    });
+
+    it('インラインコード・コードフェンスの中の<img>は、対象外', () => {
+      expect(codes('`<img src="https://example.com/a.png">`')).toEqual([]);
+      expect(codes('```\n<img src="https://example.com/a.png">\n```')).toEqual([]);
+    });
+  });
+
   describe('画像', () => {
     it('外部URLの画像を、行番号つきで検出する', () => {
       expect(linesOf('本文\n\n![図](https://example.com/a.png)', 'unsupported-image')).toEqual([3]);

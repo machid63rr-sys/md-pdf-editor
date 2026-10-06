@@ -9,14 +9,17 @@ import rehypeStringify from 'rehype-stringify';
 import { all as allLanguages } from 'lowlight';
 import { visit, SKIP } from 'unist-util-visit';
 import { toString } from 'mdast-util-to-string';
-import type { Root as MdastRoot, Code, Heading, Paragraph, PhrasingContent, RootContent } from 'mdast';
+import type { Root as MdastRoot, Code, Heading, Image, Paragraph, PhrasingContent, RootContent } from 'mdast';
 import type { Element as HastElement, Root as HastRoot } from 'hast';
 import { classifyReference } from '../shared/assetPath.js';
+import { parseImageTags, type ImageTag } from '../shared/imageTag.js';
 import { diagramViewOf, isMermaidLanguage, sizedSvg, type DiagramOutcome } from '../shared/mermaid.js';
 
 /*
  * Markdown → HTML(PDF用)。
- * - 生HTMLは実行も黙殺もせず、文字としてそのまま表示する(例: <br> は「<br>」と表示される)
+ * - 生HTMLは実行も黙殺もせず、文字としてそのまま表示する(例: <br> は「<br>」と表示される)。
+ *   ただし、<img> のタグだけは画像として扱う(エディタで大きさを変えた画像は、<img width="…"> の形で保存されるため)。
+ *   使う属性は src・alt・title・width・height だけで、画像の扱いは、![]() の画像と同じ(下記)
  * - front matter(YAML)は、内容を失わないようコードブロックとして表示する
  * - 段落内の改行はすべて改行として扱う(編集画面の表示と揃えるため)
  * - リンクは http/https/mailto/tel と相対URLのみ有効。それ以外は「文字 (URL)」に置き換える
@@ -56,7 +59,13 @@ function textWithBreaks(value: string): PhrasingContent[] {
   return nodes;
 }
 
-// 生HTML(html)とfront matter(yaml)を、実行もせず消しもしない形に置き換える
+// <img> のタグを、Markdownの画像(![]())と同じ画像にする(大きさの指定があれば、それも引き継ぐ)
+function imageNodeOf(tag: ImageTag): Image {
+  const size = { ...(tag.width === undefined ? {} : { width: tag.width }), ...(tag.height === undefined ? {} : { height: tag.height }) };
+  return { type: 'image', url: tag.src, alt: tag.alt, title: tag.title ?? null, data: { hProperties: size } };
+}
+
+// 生HTML(html)とfront matter(yaml)を、実行もせず消しもしない形に置き換える。<img> のタグだけは、画像にする
 function remarkNeutralizeRawContent() {
   return (tree: MdastRoot): void => {
     visit(tree, (node, index, parent) => {
@@ -65,7 +74,8 @@ function remarkNeutralizeRawContent() {
       }
       let replacement: RootContent[];
       if (node.type === 'html') {
-        const inline = textWithBreaks(node.value);
+        const images = parseImageTags(node.value)?.map(imageNodeOf);
+        const inline = images ?? textWithBreaks(node.value);
         replacement = FLOW_PARENTS.has(parent.type) ? [{ type: 'paragraph', children: inline }] : inline;
       } else if (node.type === 'yaml') {
         replacement = [{ type: 'code', lang: 'yaml', value: node.value }];

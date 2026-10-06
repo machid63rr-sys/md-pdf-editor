@@ -1,6 +1,8 @@
 import React, { useCallback, useMemo, useState } from 'react';
 import type { MarkdownDocument } from './documents';
 import { isImagePath } from './assets';
+import EmbedStatus from './EmbedStatus';
+import type { EmbedNotice } from './embedImage';
 import { defaultBaseName } from './filename';
 import { lintMarkdown } from './lint';
 import { collectMarkdownAssets } from './markdownAssets';
@@ -8,6 +10,7 @@ import type { OutputFile } from './outputMode';
 import OutputPanel from './OutputPanel';
 import { requestPdf } from './pdfClient';
 import RichMarkdownEditor from './RichMarkdownEditor';
+import SourceArea from './SourceArea';
 import WarningList from './WarningList';
 
 interface EditViewProps {
@@ -38,6 +41,8 @@ const EditView: React.FC<EditViewProps> = ({ document, onClose }) => {
   const [editorKey, setEditorKey] = useState(0);
   const [mode, setMode] = useState<EditorMode>('rich');
   const [parseError, setParseError] = useState<string | null>(null);
+  // 画像のドロップ・貼り付けによる埋め込みの結果
+  const [embedNotice, setEmbedNotice] = useState<EmbedNotice | null>(null);
 
   const { assets, baseDir } = document;
   // 取り込んだ画像として表示できる参照か(相対パスの画像が、取り込んだファイルの中にあるか)
@@ -72,6 +77,7 @@ const EditView: React.FC<EditViewProps> = ({ document, onClose }) => {
     if (next === mode) {
       return;
     }
+    setEmbedNotice(null);
     if (next === 'rich') {
       setParseError(null);
       setEditorSeed(markdown);
@@ -144,18 +150,15 @@ const EditView: React.FC<EditViewProps> = ({ document, onClose }) => {
               onChange={setMarkdown}
               onParseError={handleParseError}
               resolveImage={resolveImage}
+              onEmbedNotice={setEmbedNotice}
             />
           ) : (
-            <textarea
-              className="source-area"
-              aria-label="Markdown"
-              value={markdown}
-              onChange={(event) => setMarkdown(event.target.value)}
-              spellCheck={false}
-            />
+            <SourceArea value={markdown} onChange={setMarkdown} ariaLabel="Markdown" snippet="markdown" onNotice={setEmbedNotice} />
           )}
         </div>
+        <EmbedStatus notice={embedNotice} />
         <p className="hint">
+          画像ファイル(PNG・JPEG・GIF・WebP・SVG。1枚10MBまで)をドラッグ&ドロップすると、カーソルの位置に、画像のデータを埋め込みます(Markdownの中に、画像のデータが文字として入るため、文書が大きくなります)。
           「プレビュー」で一度でも編集すると、Markdown全体の書き方が正規化されます(箇条書きの記号、表の桁揃えなど。内容は保たれます)。
           PDFはサーバ側のフォントで描画されるため、プレビューと字形や改ページ位置が少し異なることがあります。
         </p>

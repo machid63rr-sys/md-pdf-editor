@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { deflateSync } from 'node:zlib';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -154,6 +155,92 @@ function countPixels(pdfPath: string, matches: (red: number, green: number, blue
 
 // 図の箱の塗り(薄い紫 #ececff)。コードブロックの背景(薄い灰色 #f3f4f6)とは、青みの差で見分ける
 const isDiagramFill = (r: number, g: number, b: number): boolean => b > 240 && b - r > 12 && b - g > 12;
+
+// 単色のPNG(幅・高さ・色を指定)。画像を、どの大きさで表示したかを、PDFの画素で測るために使う
+function solidPng(width: number, height: number, [red, green, blue]: [number, number, number]): string {
+  const crcTable = Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) {
+      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    return c >>> 0;
+  });
+  const crc32 = (data: Buffer): number => {
+    let c = 0xffffffff;
+    for (const byte of data) {
+      c = (crcTable[(c ^ byte) & 0xff] as number) ^ (c >>> 8);
+    }
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type: string, data: Buffer): Buffer => {
+    const body = Buffer.concat([Buffer.from(type, 'latin1'), data]);
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(data.length);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(crc32(body));
+    return Buffer.concat([length, body, crc]);
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header.set([8, 2, 0, 0, 0], 8); // 8bit・RGB
+  const row = Buffer.concat([Buffer.from([0]), Buffer.from(Array.from({ length: width }, () => [red, green, blue]).flat())]);
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', header),
+    chunk('IDAT', deflateSync(Buffer.concat(Array.from({ length: height }, () => row)))),
+    chunk('IEND', Buffer.alloc(0)),
+  ]);
+  return `data:image/png;base64,${png.toString('base64')}`;
+}
+
+describe('Markdownの中の<img>タグ(エディタで大きさを変えた画像)(実Chromium)', () => {
+  const red = solidPng(200, 100, [220, 20, 20]);
+  const isRed = (r: number, g: number, b: number): boolean => r > 180 && g < 80 && b < 80;
+  // 80dpiで1ページ目を画像にしたときの、1CSSピクセルあたりの画素数: 80 / 96
+  const pixelsPerCssPx = 80 / 96;
+
+  const redPixelsOf = async (name: string, markdown: string): Promise<{ path: string; red: number }> => {
+    const path = writePdf(name, await renderer.render(buildDocumentHtml(markdown, css)));
+    return { path, red: countPixels(path, isRed) };
+  };
+
+  it('大きさ(width・height)を指定した<img>は、PDFで、画像として、その大きさで表示される(タグの文字は出ない)', async () => {
+    const { path, red: area } = await redPixelsOf('img-tag.pdf', `# 画像\n\n<img src="${red}" width="300" height="150" />\n\n本文`);
+
+    expect(poppler('pdfimages', '-list', path).split('\n').filter((line) => /^\s*\d+\s+\d+\s+image\b/.test(line))).toHaveLength(1);
+    const text = poppler('pdftotext', path, '-');
+    expect(text).not.toContain('<img');
+    expect(text).not.toContain('base64');
+    expect(text).toContain('本文');
+    // 300x150(CSSピクセル)の面積(±8%)
+    const expected = 300 * 150 * pixelsPerCssPx ** 2;
+    expect(area).toBeGreaterThan(expected * 0.92);
+    expect(area).toBeLessThan(expected * 1.08);
+  });
+
+  it('大きさを指定しない<img>は、画像そのものの大きさ(200x100)で表示される', async () => {
+    const { red: area } = await redPixelsOf('img-tag-natural.pdf', `<img src="${red}">`);
+    const expected = 200 * 100 * pixelsPerCssPx ** 2;
+    expect(area).toBeGreaterThan(expected * 0.92);
+    expect(area).toBeLessThan(expected * 1.08);
+  });
+
+  it('ページの幅を超える大きさを指定しても、はみ出さず、縦横比(2:1)を保って縮められる', async () => {
+    const { red: area } = await redPixelsOf('img-tag-wide.pdf', `<img src="${red}" width="2000" height="1000" />`);
+    // 本文の幅(170mm = 約642CSSピクセル)に収まり、高さは、画像の縦横比から決まる(約321)。引き伸ばされた比率(2:1ではない)にはならない
+    const width = 170 / 25.4 * 96;
+    const expected = width * (width / 2) * pixelsPerCssPx ** 2;
+    expect(area).toBeGreaterThan(expected * 0.92);
+    expect(area).toBeLessThan(expected * 1.08);
+  });
+
+  it('画像の記法 ![]() と同じ大きさ・同じ見た目になる(<img>は、大きさの指定を加えただけ)', async () => {
+    const markdownImage = await redPixelsOf('img-md.pdf', `![](${red})`);
+    const tag = await redPixelsOf('img-tag-same.pdf', `<img src="${red}">`);
+    expect(tag.red).toBe(markdownImage.red);
+  });
+});
 
 describe('コードの色分け(実Chromium)', () => {
   // キーワードの色(#c22b3d)に近い、赤い点。見出し・本文・背景(灰色)・コードの文字色(黒に近い)には現れない色

@@ -34,8 +34,10 @@ describe('renderMarkdown', () => {
       const html = body('<script>alert(1)</script>\n\n文中の <img src=x onerror=alert(1)> です');
       expect(html).not.toContain('<script');
       expect(html).not.toContain('<img');
+      expect(html).not.toContain('onerror');
       expect(html).toContain('&#x3C;script>alert(1)&#x3C;/script>');
-      expect(html).toContain('&#x3C;img src=x onerror=alert(1)>');
+      // <img> のタグは画像として扱い、onerror などの属性は捨てる。表示できない画像(src=x)は、文字になる
+      expect(html).toContain('[画像: ](x)');
     });
 
     it('表セル内の<br>も黙って消さず、文字として表示する', () => {
@@ -156,6 +158,85 @@ describe('renderMarkdown', () => {
   it('最初のH1をタイトルにする。無ければ「無題」', () => {
     expect(renderMarkdown('本文\n\n# 取扱説明書 *第2版*').title).toBe('取扱説明書 第2版');
     expect(renderMarkdown('## 小見出しだけ').title).toBe('無題');
+  });
+});
+
+describe('Markdownの中の<img>タグ(エディタで大きさを変えた画像)', () => {
+  const dataUri = 'data:image/png;base64,iVBORw==';
+  const assets: MarkdownAssets = { baseDir: 'docs', files: { 'docs/img/a.png': dataUri } };
+
+  it('画像として表示する。大きさ(width・height)も引き継ぐ', () => {
+    const html = body(`本文<img height="166" width="300" src="${dataUri}" />`);
+    expect(html).toContain('<img');
+    expect(html).toMatch(/<img [^>]*src="data:image\/png;base64,iVBORw=="/);
+    expect(html).toMatch(/width="300"/);
+    expect(html).toMatch(/height="166"/);
+    // タグが、文字として表示されることはない
+    expect(html).not.toContain('&#x3C;img');
+    expect(html).not.toContain('&#x3C;');
+  });
+
+  it('alt・titleも引き継ぎ、実体参照は正しく扱う', () => {
+    const html = body(`<img src="${dataUri}" alt="A &amp; B" title="説明" width="50%">`);
+    expect(html).toContain('alt="A &#x26; B"');
+    expect(html).toContain('title="説明"');
+    expect(html).toContain('width="50%"');
+  });
+
+  it('文章の途中でも、単独の行でも、箇条書き・引用・表の中でも、画像になる', () => {
+    const tag = `<img src="${dataUri}" width="10">`;
+    for (const markdown of [`前${tag}後`, tag, `- ${tag}`, `> ${tag}`, `| a |\n| - |\n| ${tag} |`]) {
+      const html = body(markdown);
+      expect(html, markdown).toContain('<img');
+      expect(html, markdown).not.toContain('&#x3C;');
+    }
+  });
+
+  it('単独の行は、段落になる。同じ行に複数あれば、複数の画像になる', () => {
+    expect(body(`<img src="${dataUri}">`)).toMatch(/^<p><img /);
+    expect(body(`<img src="${dataUri}"> <img src="${dataUri}">`).match(/<img /g)).toHaveLength(2);
+  });
+
+  it('取り込んだ画像(assets)を指していれば、表示する', () => {
+    const html = renderMarkdown('<img src="img/a.png" width="120">', assets).bodyHtml;
+    expect(html).toContain(`src="${dataUri}"`);
+    expect(html).toContain('width="120"');
+  });
+
+  it('![]() の画像と同じ扱い: 表示できない画像(外部URL・渡されていないファイル・javascript:)は、文字にする(大きさは付けない)', () => {
+    for (const src of ['https://example.com/a.png', 'img/none.png', 'javascript:alert(1)', 'data:text/html;base64,PHNjcmlwdD4=']) {
+      const html = renderMarkdown(`<img src="${src}" width="10">`, assets).bodyHtml;
+      expect(html, src).not.toContain('<img');
+      expect(html, src).toContain('[画像: ](');
+    }
+  });
+
+  it('使わない属性(style・onerror・class・srcset)は、出力されない', () => {
+    const html = body(`<img src="${dataUri}" onerror="alert(1)" style="width:1px" class="x" srcset="b.png 2x" onload="alert(2)">`);
+    expect(html).toContain('<img');
+    for (const name of ['onerror', 'style=', 'class=', 'srcset', 'onload', 'alert']) {
+      expect(html, name).not.toContain(name);
+    }
+  });
+
+  it('大きさが数字・「数字%」でなければ、付けない', () => {
+    const html = body(`<img src="${dataUri}" width="expression(alert(1))" height="10px">`);
+    expect(html).toContain('<img');
+    expect(html).not.toContain('width=');
+    expect(html).not.toContain('height=');
+  });
+
+  it('<img>以外のHTML・<img>が他のタグや文字と混ざるHTML・srcの無い<img>は、これまでどおり、文字として表示する', () => {
+    for (const markdown of ['<br>', '<p><img src="' + dataUri + '"></p>', '<img src="' + dataUri + '"><script>alert(1)</script>', '<img alt="x">']) {
+      const html = body(markdown);
+      expect(html, markdown).toContain('&#x3C;');
+      expect(html, markdown).not.toContain('<script');
+    }
+  });
+
+  it('コードブロック・インラインコードの中の<img>は、文字のまま', () => {
+    expect(body('`<img src="a.png">`')).toContain('<code>&#x3C;img src="a.png"></code>');
+    expect(body('```html\n<img src="a.png">\n```')).not.toMatch(/<img /);
   });
 });
 

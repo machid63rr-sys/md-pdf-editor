@@ -1,4 +1,6 @@
 import { forwardRef, useCallback, useImperativeHandle, useRef } from 'react';
+import { rangeAtPoint } from './dropPoint';
+import { htmlImage, readImages, summarize, type EmbedNotice } from './embedImage';
 import { ORIGINAL_ATTRIBUTE_PREFIX } from './htmlCompose';
 
 /*
@@ -21,6 +23,8 @@ interface HtmlPreviewProps {
   editable: boolean;
   // 編集のたびに(少し間引いて)、iframe内の文書全体のHTMLを渡す。editable のときだけ呼ばれる
   onEdit?: (liveHtml: string) => void;
+  // 画像ファイルのドロップによる埋め込みの結果(editable のときだけ呼ばれる)
+  onEmbedNotice?: (notice: EmbedNotice | null) => void;
 }
 
 const EDIT_DEBOUNCE_MS = 120;
@@ -80,13 +84,32 @@ export function serializeDocument(doc: Document): string {
   return doctype + root.outerHTML;
 }
 
-const HtmlPreview = forwardRef<HtmlPreviewHandle, HtmlPreviewProps>(function HtmlPreview({ srcDoc, editable, onEdit }, ref) {
+// 画像の挿入位置: ドロップされた位置、無ければ現在のカーソル、それも無ければ本文の末尾
+function insertionRange(doc: Document, win: Window, x: number, y: number): Range {
+  const inBody = (range: Range | null): range is Range => range !== null && doc.body.contains(range.startContainer);
+  const dropped = rangeAtPoint(doc, x, y);
+  if (inBody(dropped)) {
+    return dropped;
+  }
+  const current = win.getSelection()?.rangeCount ? win.getSelection()?.getRangeAt(0) ?? null : null;
+  if (inBody(current)) {
+    return current;
+  }
+  const end = doc.createRange();
+  end.selectNodeContents(doc.body);
+  end.collapse(false);
+  return end;
+}
+
+const HtmlPreview = forwardRef<HtmlPreviewHandle, HtmlPreviewProps>(function HtmlPreview({ srcDoc, editable, onEdit, onEmbedNotice }, ref) {
   const frame = useRef<HTMLIFrameElement>(null);
   const pending = useRef<number | null>(null);
   const scroll = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   // 最新のonEditを使う(iframeの読み込み時に登録したイベントから呼ぶため)
   const latestOnEdit = useRef(onEdit);
   latestOnEdit.current = onEdit;
+  const latestOnEmbedNotice = useRef(onEmbedNotice);
+  latestOnEmbedNotice.current = onEmbedNotice;
 
   const emit = useCallback((): void => {
     pending.current = null;
@@ -132,6 +155,10 @@ const HtmlPreview = forwardRef<HtmlPreviewHandle, HtmlPreviewProps>(function Htm
       },
       true,
     );
+    // ファイルのドロップで、iframeが別の文書に切り替わらないようにする(編集できない側も同様)
+    for (const type of ['dragover', 'drop'] as const) {
+      doc.addEventListener(type, (event) => event.preventDefault());
+    }
     if (!editable) {
       return;
     }
@@ -152,10 +179,25 @@ const HtmlPreview = forwardRef<HtmlPreviewHandle, HtmlPreviewProps>(function Htm
         doc.execCommand('insertText', false, text);
       }
     });
-    // ファイルのドロップで、iframeが別の文書に切り替わらないようにする
-    for (const type of ['dragover', 'drop'] as const) {
-      doc.addEventListener(type, (event) => event.preventDefault());
-    }
+    // 画像ファイルをドロップすると、ドロップした位置に、画像のデータ(data: URI)を埋め込む。
+    // 画像以外のファイルは、理由を知らせる(文字などのドロップは、何もしない)
+    doc.addEventListener('drop', (event) => {
+      const files = [...(event.dataTransfer?.files ?? [])];
+      if (files.length === 0) {
+        return;
+      }
+      const { clientX, clientY } = event;
+      void readImages(files).then((result) => {
+        latestOnEmbedNotice.current?.(summarize(result));
+        if (result.images.length > 0) {
+          win.getSelection()?.removeAllRanges();
+          win.getSelection()?.addRange(insertionRange(doc, win, clientX, clientY));
+          win.focus();
+          // 挿入すると inputイベントが起き、元のHTMLへ、この画像の分だけが反映される
+          doc.execCommand('insertHTML', false, result.images.map(htmlImage).join(''));
+        }
+      });
+    });
   };
 
   const run = (button: ToolbarButton): void => {

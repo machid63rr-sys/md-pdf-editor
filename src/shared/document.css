@@ -203,6 +203,10 @@
 :is(.document, .md-editor-content) img {
   max-width: 100%;
 }
+/* <img width="300" height="166"> のように、大きさを指定した画像が、幅を狭められたとき(max-width)も、縦横比を保つ */
+.document img {
+  height: auto;
+}
 
 /* 印刷時: 長い表は見出し行を各ページで繰り返し、行の途中では改ページしない */
 @media print {

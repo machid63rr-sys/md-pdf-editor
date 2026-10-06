@@ -1,5 +1,7 @@
 import React, { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import type { HtmlDocument, Stylesheet } from './documents';
+import EmbedStatus from './EmbedStatus';
+import type { EmbedNotice } from './embedImage';
 import { defaultBaseName } from './filename';
 import { composeDocument, composeHtml, type ComposeContext } from './htmlCompose';
 import { patchHtmlSource } from './htmlPatch';
@@ -8,6 +10,7 @@ import { lintHtml } from './lintHtml';
 import type { OutputFile } from './outputMode';
 import OutputPanel from './OutputPanel';
 import { requestPdf } from './pdfClient';
+import SourceArea from './SourceArea';
 import WarningList from './WarningList';
 
 interface HtmlEditViewProps {
@@ -58,6 +61,8 @@ const HtmlEditView: React.FC<HtmlEditViewProps> = ({ document, onClose }) => {
   // 画像を読み込むたびに増やし、隣のプレビューを作り直す
   const [imagesVersion, setImagesVersion] = useState(0);
   const [patchError, setPatchError] = useState<string | null>(null);
+  // 画像のドロップによる埋め込みの結果
+  const [embedNotice, setEmbedNotice] = useState<EmbedNotice | null>(null);
   const preview = useRef<HtmlPreviewHandle>(null);
 
   // HTML・CSSが参照している、取り込んだ画像を読み込む(読み込めた画像が増えたら、表示を更新する)
@@ -127,6 +132,7 @@ const HtmlEditView: React.FC<HtmlEditViewProps> = ({ document, onClose }) => {
     if (next === tab) {
       return;
     }
+    setEmbedNotice(null);
     if (tab === PREVIEW_TAB) {
       preview.current?.flush();
     }
@@ -195,24 +201,24 @@ const HtmlEditView: React.FC<HtmlEditViewProps> = ({ document, onClose }) => {
             seed === null || editableDoc === null ? (
               <p className="notice notice-info">画像を読み込んでいます…</p>
             ) : (
-              <HtmlPreview key={seed.id} ref={preview} srcDoc={editableDoc} editable onEdit={handlePreviewEdit} />
+              <HtmlPreview key={seed.id} ref={preview} srcDoc={editableDoc} editable onEdit={handlePreviewEdit} onEmbedNotice={setEmbedNotice} />
             )
           ) : (
             <div className="source-split">
-              <textarea
-                className="source-area"
-                aria-label={currentStylesheet === undefined ? 'HTML' : `CSS: ${currentStylesheet.path}`}
+              <SourceArea
+                ariaLabel={currentStylesheet === undefined ? 'HTML' : `CSS: ${currentStylesheet.path}`}
                 value={currentStylesheet === undefined ? html : currentStylesheet.text}
-                onChange={(event) =>
-                  currentStylesheet === undefined ? setHtml(event.target.value) : editStylesheet(currentStylesheet.path, event.target.value)
-                }
-                spellCheck={false}
+                onChange={(value) => (currentStylesheet === undefined ? setHtml(value) : editStylesheet(currentStylesheet.path, value))}
+                snippet={currentStylesheet === undefined ? 'html' : 'css'}
+                onNotice={setEmbedNotice}
               />
               <HtmlPreview srcDoc={sideDoc} editable={false} />
             </div>
           )}
         </div>
+        <EmbedStatus notice={embedNotice} />
         <p className="hint">
+          画像ファイル(PNG・JPEG・GIF・WebP・SVG。1枚10MBまで)をドラッグ&ドロップすると、画像のデータを埋め込みます(プレビューではドロップした位置に、HTML・CSSのタブではカーソルの位置に、画像を書き込みます。HTML・CSSの中に画像のデータが文字として入るため、文書が大きくなります)。
           プレビューで編集すると、編集した箇所のHTMLだけが書き換わります(編集していない部分は、取り込んだままです)。
           プレビューはスクリプトを実行せず、外部のファイルも読み込みません(PDFと同じ)。PDFはサーバ側のフォントで描画されるため、
           プレビューと字形や改ページ位置が少し異なることがあります。

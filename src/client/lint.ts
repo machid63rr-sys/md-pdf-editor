@@ -1,3 +1,4 @@
+import { imageTagsIn } from '../shared/imageTag';
 import { imageReferencesIn } from './markdownRefs';
 import { forEachLineOutsideFences, splitInlineCode } from './markdownText';
 import { findBrokenTables } from './tableCheck';
@@ -64,13 +65,16 @@ export function lintMarkdown(markdown: string, canDisplayImage?: (reference: str
       return;
     }
     const prose = withoutInlineCode(line);
+    // 画像として読める <img> のタグは、画像として扱われる(文字としては表示されない)ため、HTMLタグの警告の対象から外す。
+    // その画像が表示できるかは、![]() の画像と同じように、下で調べる
+    const proseWithoutImages = imageTagsIn(prose).reduce((text, entry) => text.replace(entry.text, ' '), prose);
     const hasUnsupportedImage = imageReferencesIn(prose).some(
       (reference) => !isDataImage(reference) && canDisplayImage?.(reference) !== true,
     );
     if (hasUnsupportedImage) {
       imageLines.push(lineNumber);
     }
-    if (RAW_HTML.test(prose)) {
+    if (RAW_HTML.test(proseWithoutImages)) {
       htmlLines.push(lineNumber);
     }
   });
