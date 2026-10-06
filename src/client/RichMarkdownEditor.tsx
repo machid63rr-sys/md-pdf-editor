@@ -23,7 +23,9 @@ import {
   Separator,
 } from '@mdxeditor/editor';
 import '@mdxeditor/editor/style.css';
+import { isMermaidLanguage } from '../shared/mermaid';
 import { escapeForMdx, unescapeFromMdx } from './mdxEscape';
+import MermaidBlockEditor from './MermaidBlockEditor';
 
 interface RichMarkdownEditorProps {
   // 編集モードに入った時点のMarkdown(以降の変更は内部で保持し、onChangeで親へ通知する)
@@ -71,6 +73,8 @@ const CODE_BLOCK_LANGUAGES = {
  *   利用者が触っていない本文が、取り込んだMarkdownから勝手に書き換わるのを避けるため。
  * - 解釈できない記法(脚注・参照形式のリンクなど)があると onParseError で通知する
  * - 取り込んだ画像(相対パスの画像)は、resolveImage で表示用のURLにして表示する
+ * - コードブロックは、言語ごとに色分けして表示する(言語は、ブロックの右上で選べる)。
+ *   Mermaidのコードブロックは、コードの下に図も表示する
  */
 const RichMarkdownEditor: React.FC<RichMarkdownEditorProps> = ({ initialMarkdown, onChange, onParseError, resolveImage }) => (
   <MDXEditor
@@ -92,7 +96,11 @@ const RichMarkdownEditor: React.FC<RichMarkdownEditorProps> = ({ initialMarkdown
       tablePlugin(),
       imagePlugin({ imagePreviewHandler: resolveImage }),
       frontmatterPlugin(),
-      codeBlockPlugin({ defaultCodeBlockLanguage: 'txt' }),
+      // Mermaidのコードブロックだけ、図も表示するエディタにする(それ以外は、codeMirrorPluginの色分けつきエディタ)
+      codeBlockPlugin({
+        defaultCodeBlockLanguage: 'txt',
+        codeBlockEditorDescriptors: [{ priority: 100, match: (language) => isMermaidLanguage(language), Editor: MermaidBlockEditor }],
+      }),
       codeMirrorPlugin({ codeBlockLanguages: CODE_BLOCK_LANGUAGES }),
       markdownShortcutPlugin(),
       toolbarPlugin({

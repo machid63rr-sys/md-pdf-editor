@@ -52,6 +52,8 @@ docker compose up -d --build
 - PDFはサーバ側のChromiumで、MarkdownからA4縦(余白20mm、フッターにページ番号)で生成します。日本語はNoto Sans CJK JPの字形です。プレビューはお使いのOSのフォントで描画されるため、字形や折り返し位置、改ページ位置が少し異なることがあります。
 - **生HTML**(`<br>`、`<div>`、`<!-- コメント -->` など)は、実行も削除もせず、**文字としてそのまま表示**されます。出力前に画面に警告が出ます。
 - **画像**は、`data:image/…;base64,…`(png・jpeg・gif・webp・svg)と、**取り込んだ画像**(`![図](images/a.png)` のような相対パス。フォルダごと取り込んだ場合は、Markdownのフォルダを基準に解決)が、エディタとPDFに表示されます。それ以外(外部のURL・取り込んだ中に無いもの)は `[画像: 代替文](URL)` という文字になります(外部へは通信しません)。出力前に警告が出ます。Markdownの本文は書き換えません(画像のパスはそのまま保存されます)。SVGは `<img>` として表示するため、スクリプトは実行されず、外部のファイルも読み込まれません。
+- **コードブロック**は、言語名(```` ```python ````、```` ```js ```` など)に応じて**構文ごとに色分け**されます。エディタでは、コードブロックの右上で言語を選べます。PDFは、約190言語(Python・JavaScript・TypeScript・Bash・SQL・Java・C#・C++・Go・Rust・Ruby・PHP・Kotlin・Swift・PowerShell・Dockerfile・YAML・JSON・HTML・CSS・Diff など)に対応し、`py`・`js`・`sh` のような別名も使えます。言語名の無いコードブロック、`text` / `txt`、未対応の言語名は、色分けせずそのまま表示します。10万文字を超える長いコードは、色分けせずに表示します。
+- **Mermaid の図**: 言語名を `mermaid` にしたコードブロックは、エディタではコードの下に図を表示し、PDFでは図として出力します(フローチャート・シーケンス図・ガントチャート・円グラフなど、Mermaidが対応する図)。**PDFに何を出すかは、コードブロックごとに選べます**: 「図のみ」(既定)・「コードのみ」・「コードと図」(コードの下に図)。エディタの各ブロックの下にある「PDFでの表示」で選ぶと、言語名の後ろに `show=code` / `show=both` と書き込まれます(「図のみ」は何も書きません)。Markdownに手で書いてもかまいません(例: ` ```mermaid show=both `)。言語名の後ろの文字は、ほかのMarkdownツールでは無視されます。エディタでは、編集しやすいよう、選択に関わらずコードと図の両方を表示します。Markdownに保存されるのは、コードと、この選択だけです。図が描けない(構文の誤りなど)ときは、エディタに理由を表示し、PDFには「描画できなかったため、コードのまま表示します」という理由とコードを入れます(PDFの生成は続けます)。「コードのみ」の図は、描画しません。図は1つの文書で30個までで、超えた分はコードのまま表示します。図の文字に含まれるHTMLやスクリプトは実行されず、図の描画でも外部へは通信しません。図があるPDFは、図の描画のために、生成に1秒ほど余分にかかります。
 - リンクは http / https / mailto / tel と相対URLだけ有効です。`javascript:` などは `文字 (URL)` になります。
 - 先頭の **front matter**(YAML)は、PDFにYAMLのコードブロックとして表示されます。
 - 段落内の改行は、すべて改行として扱います(プレビューの表示と揃えるため)。
@@ -124,9 +126,9 @@ curl -X POST http://localhost:8088/api/pdf \
 
 ## 構成と開発
 
-- 1コンテナです。Express が、ビルド済みの画面(React + `@mdxeditor/editor`。HTMLの解析に `parse5`)の配信と、`POST /api/pdf` を提供します。
-- PDF生成は、要求ごとにChromiumを起動・終了します(常駐させません)。同時に複数の要求が来た場合は、順番に処理します。描画するHTMLは、JavaScript無効・外部通信遮断の状態で処理します。
-- 起動時にPDFを1本生成して、Chromiumとフォントが使えることを確認します。失敗した場合はコンテナが終了します(`docker compose logs` で原因を確認できます)。
+- 1コンテナです。Express が、ビルド済みの画面(React + `@mdxeditor/editor`。HTMLの解析に `parse5`、図の描画に `mermaid`)の配信と、`POST /api/pdf` を提供します。
+- PDF生成は、要求ごとにChromiumを起動・終了します(常駐させません)。同時に複数の要求が来た場合は、順番に処理します。描画するHTMLは、JavaScript無効・外部通信遮断の状態で処理します(Mermaidの図を作るときだけ、図の描画用の別ページでJavaScriptを使います。実行されるのはMermaid本体だけで、外部通信は遮断し、PDFにするページは、JavaScript無効のままです)。
+- 起動時にPDFを1本生成し、Mermaidの図を1つ描画して、Chromiumとフォント・図の描画が使えることを確認します。失敗した場合はコンテナが終了します(`docker compose logs` で原因を確認できます)。
 - コンテナは、非root・読み取り専用ルート・全Capability削除で動きます。
 
 テストは、Dockerの `test` ステージで実行します(型チェック → ビルド → 全テスト。実Chromiumを使う、PDF生成と画面操作の結合テストを含みます)。
@@ -139,8 +141,8 @@ docker build --target test -t md-pdf-editor:test .
 
 ```
 src/client/   画面(取り込み・編集・出力)と、Markdown・HTML(差分の反映 htmlPatch、CSS・画像の埋め込み htmlCompose)・取り込んだファイル一式(assets)・ファイル名・出力処理のロジック
-src/server/   API、Markdown→HTML、Chromiumによる PDF生成、起動時セルフチェック
-src/shared/   クライアントとサーバが共通で使うもの(プレビューとPDFのCSS document.css、画像・CSSなどの参照を解決する assetPath.ts)
+src/server/   API、Markdown→HTML(コードの色分け・Mermaidの図の差し込み)、Chromiumによる PDF生成・Mermaidの図の描画、起動時セルフチェック
+src/shared/   クライアントとサーバが共通で使うもの(プレビューとPDFのCSS document.css、画像・CSSなどの参照を解決する assetPath.ts、Mermaidの設定・SVGの扱い mermaid.ts)
 tests/        PDF生成・画面操作の結合テスト(実Chromium)
 ```
 

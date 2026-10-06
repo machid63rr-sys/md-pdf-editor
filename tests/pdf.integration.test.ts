@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { prepareHtmlForPdf } from '../src/server/htmlDocument.js';
-import { buildDocumentHtml } from '../src/server/markdownToHtml.js';
+import { buildDocumentHtml, extractMermaidSources, type DiagramMap } from '../src/server/markdownToHtml.js';
 import { createPdfRenderer, type PdfRenderer } from '../src/server/pdf.js';
 import { selfCheck } from '../src/server/selfCheck.js';
 
@@ -18,6 +18,7 @@ const css = readFileSync(new URL('../src/shared/document.css', import.meta.url),
 const renderer: PdfRenderer = createPdfRenderer({
   chromiumPath: process.env['CHROMIUM_PATH'] ?? '/usr/bin/chromium',
   timeoutMs: 60_000,
+  mermaidScript: readFileSync(new URL('../node_modules/mermaid/dist/mermaid.min.js', import.meta.url), 'utf8'),
 });
 
 let workDir: string;
@@ -126,9 +127,200 @@ describe('PDF生成(実Chromium)', () => {
   });
 
   it('存在しないChromiumを指定すると、PDFの生成に失敗として例外になる', async () => {
-    const broken = createPdfRenderer({ chromiumPath: '/nonexistent/chromium', timeoutMs: 5_000 });
+    const broken = createPdfRenderer({ chromiumPath: '/nonexistent/chromium', timeoutMs: 5_000, mermaidScript: '' });
     await expect(broken.render('<p>x</p>')).rejects.toThrowError('PDFの生成に失敗しました');
     await expect(broken.chromiumVersion()).rejects.toThrowError('Chromiumを起動できません');
+  });
+});
+
+// 1ページ目を画像にして、条件に合う色の点がいくつあるかを数える(pdftoppmが出力するP6形式のPPMを読む)
+function countPixels(pdfPath: string, matches: (red: number, green: number, blue: number) => boolean): number {
+  const root = `${pdfPath}.page`;
+  execFileSync('pdftoppm', ['-r', '80', '-f', '1', '-l', '1', '-singlefile', pdfPath, root]);
+  const ppm = readFileSync(`${root}.ppm`);
+  // ヘッダ: "P6\n<幅> <高さ>\n255\n"。その後ろが画素(R,G,Bの順)
+  const header = /^P6\s+\d+\s+\d+\s+255\s/.exec(ppm.subarray(0, 64).toString('latin1'));
+  if (header === null) {
+    throw new Error('PPMを読めません');
+  }
+  let count = 0;
+  for (let offset = header[0].length; offset + 2 < ppm.length; offset += 3) {
+    if (matches(ppm[offset] ?? 0, ppm[offset + 1] ?? 0, ppm[offset + 2] ?? 0)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+// 図の箱の塗り(薄い紫 #ececff)。コードブロックの背景(薄い灰色 #f3f4f6)とは、青みの差で見分ける
+const isDiagramFill = (r: number, g: number, b: number): boolean => b > 240 && b - r > 12 && b - g > 12;
+
+describe('コードの色分け(実Chromium)', () => {
+  // キーワードの色(#c22b3d)に近い、赤い点。見出し・本文・背景(灰色)・コードの文字色(黒に近い)には現れない色
+  const isKeywordRed = (r: number, g: number, b: number): boolean => r > 150 && g < 100 && b < 110;
+
+  it('言語名のあるコードブロックは、PDFで色が付く。言語名の無いコードブロックは、色が付かない', async () => {
+    const code = 'def greet(name):\n    return "こんにちは"\n';
+    const colored = writePdf('code-colored.pdf', await renderer.render(buildDocumentHtml('```python\n' + code + '```', css)));
+    const plain = writePdf('code-plain.pdf', await renderer.render(buildDocumentHtml('```\n' + code + '```', css)));
+
+    expect(countPixels(colored, isKeywordRed)).toBeGreaterThan(20);
+    expect(countPixels(plain, isKeywordRed)).toBe(0);
+    // 色分けしても、コードの文字は、抽出できる(フォントごとに分かれて、順序は入れ替わりうる)
+    const text = poppler('pdftotext', colored, '-');
+    expect(text).toContain('def greet(name):');
+    expect(text).toContain('こんにちは');
+  });
+
+  it.each(['javascript', 'bash', 'sql', 'java', 'go', 'rust', 'ruby', 'php', 'kotlin', 'html', 'css', 'yaml'])(
+    '%s のコードブロックも、PDFで色が付く',
+    async (language) => {
+      const code: Record<string, string> = {
+        javascript: 'const x = 1;\nfunction f() { return x; }',
+        bash: 'if [ -f a ]; then echo "hi"; fi',
+        sql: 'SELECT id FROM users WHERE id = 1;',
+        java: 'public class A { private int x = 1; }',
+        go: 'func main() { var x int = 1 }',
+        rust: 'fn main() { let x: i32 = 1; }',
+        ruby: 'def hello\n  puts "hi"\nend',
+        php: '<?php function f() { return 1; }',
+        kotlin: 'fun main() { val x = 1 }',
+        html: '<div class="a">x</div>',
+        css: '@media print { .a { color: red; } }',
+        yaml: 'key: value\nlist:\n  - 1',
+      };
+      const path = writePdf(`code-${language}.pdf`, await renderer.render(buildDocumentHtml('```' + language + '\n' + code[language] + '\n```', css)));
+      // 色が付いた点があること(キーワード・文字列・数値などの、赤・青・紫・緑・橙のいずれか)
+      const colored = countPixels(path, (r, g, b) => Math.max(r, g, b) - Math.min(r, g, b) > 90);
+      expect(colored).toBeGreaterThan(20);
+    },
+  );
+});
+
+describe('Mermaidの図(実Chromium)', () => {
+  const flow = 'graph TD\n  A[開始] --> B{判定}\n  B -->|はい| C[処理]\n  B -->|いいえ| D[終了]';
+
+  const diagramsOf = async (markdown: string): Promise<DiagramMap> => {
+    const sources = extractMermaidSources(markdown);
+    const drawn = await renderer.drawDiagrams(sources);
+    return new Map(sources.map((source, index) => [source, drawn[index] as NonNullable<(typeof drawn)[number]>]));
+  };
+
+  it('図のコードをSVGにする。結果は、渡した順に返る', async () => {
+    const [flowchart, sequence, pie] = await renderer.drawDiagrams([flow, 'sequenceDiagram\n  Alice->>Bob: こんにちは', 'pie title ペット\n  "犬" : 3\n  "猫" : 5']);
+    for (const outcome of [flowchart, sequence, pie]) {
+      expect(outcome?.ok).toBe(true);
+    }
+    expect(flowchart?.ok === true && flowchart.svg).toContain('開始');
+    expect(sequence?.ok === true && sequence.svg).toContain('Alice');
+    expect(pie?.ok === true && pie.svg).toContain('犬');
+  });
+
+  it('描けない図(構文の誤り・図の種類が不明)は、理由つきの失敗になり、ほかの図は描かれる', async () => {
+    const results = await renderer.drawDiagrams([flow, 'graph TD\n  A[ --> B', 'これは図ではありません', 'pie\n  "a" : 1']);
+    expect(results.map((result) => result.ok)).toEqual([true, false, false, true]);
+    const failures = results.flatMap((result) => (result.ok ? [] : [result.message]));
+    expect(failures).toHaveLength(2);
+    expect(failures.every((message) => message.length > 0 && !message.includes('\n'))).toBe(true);
+  });
+
+  it('図が無ければ、何も起動せず空の結果を返す', async () => {
+    expect(await renderer.drawDiagrams([])).toEqual([]);
+  });
+
+  it('図の文字に含まれるHTML・スクリプト・リンクは、実行される形では出力されない', async () => {
+    const [outcome] = await renderer.drawDiagrams([
+      'graph TD\n  A["<img src=x onerror=alert(1)>文字<script>alert(2)</script>"] --> B\n  click A href "javascript:alert(3)"\n  click B call alert(4)',
+    ]);
+    expect(outcome?.ok).toBe(true);
+    const svg = outcome?.ok === true ? outcome.svg : '';
+    // <img>の文字は、無害な形(onerror等の属性なし)で残ることがある。実行される属性・スクリプト・リンクが無いことを確かめる
+    expect(svg).not.toMatch(/<script|onerror=|javascript:|onclick=|onload=/i);
+  });
+
+  it('図の中から、安全設定を緩めることはできない(initディレクティブでsecurityLevelを変えても、スクリプトは出力されない)', async () => {
+    const [outcome] = await renderer.drawDiagrams([
+      '%%{init: {"securityLevel": "loose"}}%%\ngraph TD\n  A["<img src=x onerror=alert(1)>"] --> B\n  click A href "javascript:alert(3)"',
+    ]);
+    const svg = outcome?.ok === true ? outcome.svg : '';
+    expect(svg).not.toMatch(/onerror=|javascript:/i);
+  });
+
+  it('図の描画では、外部へ通信しない', async () => {
+    const requested: string[] = [];
+    const probe: Server = createServer((req, res) => {
+      requested.push(req.url ?? '');
+      res.end();
+    });
+    await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', resolve));
+    const { port } = probe.address() as AddressInfo;
+    try {
+      await renderer.drawDiagrams([`graph TD\n  A["<img src='http://127.0.0.1:${port}/x.png'>"] --> B\n  A --> C["<a href='http://127.0.0.1:${port}/y'>y</a>"]`]);
+      expect(requested).toEqual([]);
+    } finally {
+      await new Promise<void>((resolve, reject) => probe.close((error) => (error ? reject(error) : resolve())));
+    }
+  });
+
+  it('Markdownの図は、PDFに入る(日本語の文字も、図の中に抽出できる)。コードはPDFに出ない', async () => {
+    const markdown = `# 図のある文書\n\n本文です。\n\n\`\`\`mermaid\n${flow}\n\`\`\`\n\n続きの文です。`;
+    const path = writePdf('diagram.pdf', await renderer.render(buildDocumentHtml(markdown, css, undefined, await diagramsOf(markdown))));
+
+    const text = poppler('pdftotext', path, '-');
+    for (const label of ['開始', '判定', '処理', '終了', 'はい', 'いいえ', '続きの文です']) {
+      expect(text, label).toContain(label);
+    }
+    expect(text).not.toContain('graph TD');
+    expect(poppler('pdffonts', path)).toContain('NotoSansCJKjp');
+    // 図の中の色(薄い紫の箱)が、実際に描かれている
+    expect(countPixels(path, isDiagramFill)).toBeGreaterThan(500);
+  });
+
+  it('表示の選択: 図のみはコードがPDFに出ず、コードのみは図が出ず、両方は両方が出る', async () => {
+    const pdfOf = async (meta: string): Promise<string> => {
+      const markdown = `\`\`\`mermaid${meta}\n${flow}\n\`\`\``;
+      return writePdf(`diagram-view${meta.replace(/\W/g, '')}.pdf`, await renderer.render(buildDocumentHtml(markdown, css, undefined, await diagramsOf(markdown))));
+    };
+    const diagramPixels = (path: string): number => countPixels(path, isDiagramFill);
+
+    const diagramOnly = await pdfOf('');
+    expect(poppler('pdftotext', diagramOnly, '-')).not.toContain('graph TD');
+    expect(diagramPixels(diagramOnly)).toBeGreaterThan(500);
+
+    const codeOnly = await pdfOf(' show=code');
+    expect(poppler('pdftotext', codeOnly, '-')).toContain('graph TD');
+    expect(diagramPixels(codeOnly)).toBe(0);
+
+    const both = await pdfOf(' show=both');
+    expect(poppler('pdftotext', both, '-')).toContain('graph TD');
+    expect(diagramPixels(both)).toBeGreaterThan(500);
+  });
+
+  it('描けなかった図は、コードと理由がPDFに入り、PDFの生成は成功する', async () => {
+    const markdown = '# 誤った図\n\n```mermaid\ngraph TD\n  A[ --> B\n```';
+    const path = writePdf('diagram-broken.pdf', await renderer.render(buildDocumentHtml(markdown, css, undefined, await diagramsOf(markdown))));
+
+    const text = poppler('pdftotext', path, '-');
+    expect(text).toContain('Mermaidの図を描画できなかったため、コードのまま表示します');
+    expect(text).toContain('graph TD');
+  });
+
+  it('縦長の図は、1ページに収まる大きさに縮めて表示される', async () => {
+    const steps = Array.from({ length: 40 }, (_, index) => `  S${index}[Step${index}] --> S${index + 1}[Step${index + 1}]`).join('\n');
+    const markdown = `# 長い図\n\n\`\`\`mermaid\ngraph TD\n${steps}\n\`\`\``;
+    const path = writePdf('diagram-tall.pdf', await renderer.render(buildDocumentHtml(markdown, css, undefined, await diagramsOf(markdown))));
+
+    // 縮めて描かれた小さな文字は、1つの語として抽出されない場合があるため、図が入っていることだけを確かめる
+    expect(poppler('pdftotext', path, '-')).toContain('Step');
+    expect(Number(/Pages:\s+(\d+)/.exec(poppler('pdfinfo', path))?.[1])).toBe(1);
+  });
+
+  it('JS無効のままPDFが作られる(図を作るためにJSを有効にするのは、図の描画用のページだけ)', async () => {
+    const html = '<!doctype html><html><body><p id="t">前</p><script>document.getElementById("t").textContent="実行された";</script></body></html>';
+    await renderer.drawDiagrams([flow]);
+    const text = poppler('pdftotext', writePdf('script-after-diagram.pdf', await renderer.render(html)), '-');
+    expect(text).toContain('前');
+    expect(text).not.toContain('実行された');
   });
 });
 
@@ -212,7 +404,17 @@ describe('起動時セルフチェック', () => {
     const broken: PdfRenderer = {
       chromiumVersion: () => Promise.resolve('x'),
       render: () => Promise.resolve(Buffer.from('not a pdf')),
+      drawDiagrams: () => Promise.resolve([]),
     };
     await expect(selfCheck(broken, css)).rejects.toThrowError('生成物がPDFではありません');
+  });
+
+  it('Mermaidの図を描画できなければ例外にする', async () => {
+    const broken: PdfRenderer = {
+      chromiumVersion: () => Promise.resolve('x'),
+      render: () => Promise.resolve(Buffer.from('%PDF-1.7')),
+      drawDiagrams: () => Promise.resolve([{ ok: false, message: 'Mermaidが読み込めません' }]),
+    };
+    await expect(selfCheck(broken, css)).rejects.toThrowError('Mermaidの図を描画できません (Mermaidが読み込めません)');
   });
 });

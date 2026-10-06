@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Server } from 'node:http';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import type { DiagramOutcome } from '../shared/mermaid.js';
 import { createApp } from './app.js';
 import { PdfRenderError, type PdfRenderer, type RenderOptions } from './pdf.js';
 
@@ -12,12 +13,22 @@ import { PdfRenderError, type PdfRenderer, type RenderOptions } from './pdf.js';
 class RecordingRenderer implements PdfRenderer {
   readonly htmls: string[] = [];
   readonly options: (RenderOptions | undefined)[] = [];
+  // 図の描画を頼まれた、Mermaidのコード(呼び出しごと)
+  readonly drawn: (readonly string[])[] = [];
   failWith: Error | undefined;
 
   render(html: string, options?: RenderOptions): Promise<Buffer> {
     this.htmls.push(html);
     this.options.push(options);
     return this.failWith ? Promise.reject(this.failWith) : Promise.resolve(Buffer.from('%PDF-1.7 dummy'));
+  }
+
+  // 「ok」を含むコードは描け、それ以外は構文エラーになる代役
+  drawDiagrams(sources: readonly string[]): Promise<DiagramOutcome[]> {
+    this.drawn.push(sources);
+    return Promise.resolve(
+      sources.map((source): DiagramOutcome => (source.includes('ok') ? { ok: true, svg: '<svg viewBox="0 0 10 20"></svg>' } : { ok: false, message: 'Parse error' })),
+    );
   }
 
   chromiumVersion(): Promise<string> {
@@ -84,6 +95,83 @@ describe('POST /api/pdf', () => {
     expect(renderer.htmls[0]).not.toContain('.document{}');
     // 利用者のHTMLが指定する用紙サイズ(@page)を尊重する
     expect(renderer.options[0]).toEqual({ preferCssPageSize: true });
+  });
+
+  describe('Mermaidの図', () => {
+    const post = (markdown: string): Promise<Response> => postPdf(JSON.stringify({ markdown }));
+
+    it('図があれば、描画を依頼し、描けた図がPDFのHTMLに入る', async () => {
+      renderer.htmls.length = 0;
+      renderer.drawn.length = 0;
+      const res = await post('```mermaid\ngraph ok\n```');
+      expect(res.status).toBe(200);
+      expect(renderer.drawn).toEqual([['graph ok']]);
+      expect(renderer.htmls[0]).toContain('<figure class="mermaid-diagram">');
+    });
+
+    it('描けなかった図があっても、PDFは返し、コードのまま理由を添える', async () => {
+      renderer.htmls.length = 0;
+      const res = await post('```mermaid\nbad diagram\n```');
+      expect(res.status).toBe(200);
+      expect(renderer.htmls[0]).toContain('diagram-error');
+      expect(renderer.htmls[0]).toContain('language-mermaid');
+    });
+
+    it('同じ図は1回だけ描画を依頼する', async () => {
+      renderer.drawn.length = 0;
+      await post('```mermaid\ngraph ok\n```\n\n```mermaid\ngraph ok\n```');
+      expect(renderer.drawn).toEqual([['graph ok']]);
+    });
+
+    it('図が無ければ、描画を依頼しない(ブラウザを余計に起動しない)', async () => {
+      renderer.drawn.length = 0;
+      await post('# 見出し\n\n```python\nx = 1\n```');
+      expect(renderer.drawn).toEqual([]);
+    });
+
+    it('コードのみ(show=code)の図は、描画を依頼しない。両方(show=both)は描いて、コードと図が入る', async () => {
+      renderer.htmls.length = 0;
+      renderer.drawn.length = 0;
+      await post('```mermaid show=code\ngraph ok\n```');
+      expect(renderer.drawn).toEqual([]);
+      expect(renderer.htmls[0]).toContain('<pre><code class="language-mermaid">graph ok');
+      expect(renderer.htmls[0]).not.toContain('<figure');
+
+      await post('```mermaid show=both\ngraph ok\n```');
+      expect(renderer.drawn).toEqual([['graph ok']]);
+      expect(renderer.htmls[1]).toContain('<pre>');
+      expect(renderer.htmls[1]).toContain('<figure');
+    });
+
+    it('HTMLの場合は、図の描画を依頼しない', async () => {
+      renderer.drawn.length = 0;
+      await postPdf(JSON.stringify({ html: '<pre><code class="language-mermaid">graph ok</code></pre>' }));
+      expect(renderer.drawn).toEqual([]);
+    });
+
+    it('図が多すぎる場合は、上限までを描き、残りはコードのまま表示する', async () => {
+      const roomy = createApp({ maxMarkdownBytes: 1_000_000, renderer, css: '', clientDir, chromiumVersion: 'Chromium/test' });
+      const roomyServer = await new Promise<Server>((resolve) => {
+        const started = roomy.listen(0, '127.0.0.1', () => resolve(started));
+      });
+      try {
+        renderer.htmls.length = 0;
+        renderer.drawn.length = 0;
+        const { port } = roomyServer.address() as AddressInfo;
+        const markdown = Array.from({ length: 31 }, (_, index) => '```mermaid\ngraph ok ' + index + '\n```').join('\n\n');
+        const res = await fetch(`http://127.0.0.1:${port}/api/pdf`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ markdown }),
+        });
+        expect(res.status).toBe(200);
+        expect(renderer.drawn[0]).toHaveLength(30);
+        expect(renderer.htmls[0]?.match(/<figure/g)).toHaveLength(30);
+        expect(renderer.htmls[0]).toContain('図が多すぎるため描画しません(上限 30 個)');
+      } finally {
+        await new Promise<void>((resolve, reject) => roomyServer.close((error) => (error ? reject(error) : resolve())));
+      }
+    });
   });
 
   it('Markdownに添えた画像(baseDir・assets)が、相対パスの画像として表示される', async () => {

@@ -99,6 +99,91 @@
   font-size: 1em;
 }
 
+/* コードの色分け(PDF)。編集画面のコードは、エディタ自身が色分けする。
+   背景(#f3f4f6)の上で読めるよう、濃い色を使う */
+.document .hljs-comment,
+.document .hljs-quote {
+  color: #5a6472;
+  font-style: italic;
+}
+.document .hljs-keyword,
+.document .hljs-selector-tag,
+.document .hljs-doctag,
+.document .hljs-template-tag,
+.document .hljs-meta .hljs-keyword {
+  color: #c22b3d;
+}
+.document .hljs-string,
+.document .hljs-regexp,
+.document .hljs-template-variable {
+  color: #0a3d91;
+}
+.document .hljs-number,
+.document .hljs-literal,
+.document .hljs-attr,
+.document .hljs-attribute,
+.document .hljs-variable.language_,
+.document .hljs-selector-attr,
+.document .hljs-selector-pseudo {
+  color: #0b5cad;
+}
+.document .hljs-title,
+.document .hljs-title.function_,
+.document .hljs-title.class_,
+.document .hljs-selector-id,
+.document .hljs-selector-class {
+  color: #6a3fb5;
+}
+.document .hljs-built_in,
+.document .hljs-type,
+.document .hljs-symbol,
+.document .hljs-bullet,
+.document .hljs-link {
+  color: #b34a00;
+}
+.document .hljs-meta,
+.document .hljs-name,
+.document .hljs-tag {
+  color: #1f7a3a;
+}
+.document .hljs-section {
+  color: #0b5cad;
+  font-weight: 700;
+}
+.document .hljs-strong {
+  font-weight: 700;
+}
+.document .hljs-emphasis {
+  font-style: italic;
+}
+.document .hljs-addition {
+  color: #1a6e2e;
+  background: #dcf5e1;
+}
+.document .hljs-deletion {
+  color: #a3182a;
+  background: #fde2e5;
+}
+
+/* Mermaidの図(PDF)。ページをまたいで切れないようにする */
+.document figure.mermaid-diagram {
+  margin: 0.8em 0;
+  text-align: center;
+  break-inside: avoid;
+}
+.document figure.mermaid-diagram img {
+  max-width: 100%;
+  height: auto;
+  /* 1ページに収まらない縦長の図は、縦横比を保ったまま縮める(直前の見出しと同じページに入る高さにする) */
+  max-height: 200mm;
+  object-fit: contain;
+}
+.document .diagram-error {
+  margin-bottom: 0;
+  color: #a3182a;
+  font-size: 0.9em;
+}
+
 :is(.document, .md-editor-content) table {
   border-collapse: collapse;
   width: 100%;

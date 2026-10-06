@@ -4,12 +4,15 @@ import remarkFrontmatter from 'remark-frontmatter';
 import remarkGfm from 'remark-gfm';
 import remarkBreaks from 'remark-breaks';
 import remarkRehype from 'remark-rehype';
+import rehypeHighlight from 'rehype-highlight';
 import rehypeStringify from 'rehype-stringify';
+import { all as allLanguages } from 'lowlight';
 import { visit, SKIP } from 'unist-util-visit';
 import { toString } from 'mdast-util-to-string';
-import type { Root as MdastRoot, Heading, PhrasingContent, RootContent } from 'mdast';
-import type { Root as HastRoot } from 'hast';
+import type { Root as MdastRoot, Code, Heading, Paragraph, PhrasingContent, RootContent } from 'mdast';
+import type { Element as HastElement, Root as HastRoot } from 'hast';
 import { classifyReference } from '../shared/assetPath.js';
+import { diagramViewOf, isMermaidLanguage, sizedSvg, type DiagramOutcome } from '../shared/mermaid.js';
 
 /*
  * Markdown → HTML(PDF用)。
@@ -20,11 +23,19 @@ import { classifyReference } from '../shared/assetPath.js';
  * - 画像は、data URI(png/jpeg/gif/webp/svg)と、リクエストで渡された画像(assets)だけ表示する。
  *   それ以外(外部URL・渡されていないファイル)は「[画像: 代替文](URL)」の文字にする
  *   (svgは<img>の中では、スクリプトの実行も外部の読み込みも行われない)
+ * - コードブロックは、言語名(```python など)に応じて、構文ごとに色分けする(言語名の無いものは色分けしない)。
+ *   言語名が mermaid のものは、描画済みの図(diagrams)があれば、図として表示する(言語名の後ろの `show=` で、
+ *   図のみ・コードのみ・両方を選べる。書かなければ図のみ)。描けなかった図は、理由を添えて、コードのまま表示する
  */
 
 const ALLOWED_LINK_PROTOCOLS = new Set(['http:', 'https:', 'mailto:', 'tel:']);
 const DATA_IMAGE_URL = /^data:image\/(?:png|jpe?g|gif|webp|svg\+xml);base64,[A-Za-z0-9+/=]+$/i;
 const FLOW_PARENTS = new Set(['root', 'blockquote', 'listItem', 'footnoteDefinition']);
+
+// 色分けしない言語名(そのまま表示する)
+const PLAIN_TEXT_LANGUAGES = ['txt', 'text', 'plain', 'plaintext', 'mermaid'];
+// これより長いコードは、色分けに時間がかかるため、色分けしない
+const MAX_HIGHLIGHT_CHARS = 100_000;
 
 function isAllowedLink(url: string): boolean {
   const scheme = /^([a-zA-Z][a-zA-Z0-9+.-]*:)/.exec(url.trim());
@@ -120,14 +131,89 @@ function rehypeNeutralizeUrls() {
   };
 }
 
+// 描画済みのMermaidの図。キーは、コードブロックの中身(図のコード)
+export type DiagramMap = ReadonlyMap<string, DiagramOutcome>;
+
+const svgDataUri = (svg: string): string => `data:image/svg+xml;base64,${Buffer.from(svg, 'utf8').toString('base64')}`;
+
+function diagramFigure(outcome: DiagramOutcome & { ok: true }): Paragraph | null {
+  const sized = sizedSvg(outcome.svg);
+  if (sized === null) {
+    return null;
+  }
+  const image: HastElement = {
+    type: 'element',
+    tagName: 'img',
+    properties: { src: svgDataUri(sized.svg), width: sized.width, height: sized.height, alt: 'Mermaidの図' },
+    children: [],
+  };
+  // 空の段落を、図(figure)として出力する
+  return { type: 'paragraph', children: [], data: { hName: 'figure', hProperties: { className: ['mermaid-diagram'] }, hChildren: [image] } };
+}
+
+function failureNote(message: string): Paragraph {
+  return {
+    type: 'paragraph',
+    children: [{ type: 'text', value: `Mermaidの図を描画できなかったため、コードのまま表示します(${message})` }],
+    data: { hProperties: { className: ['diagram-error'] } },
+  };
+}
+
+// 描画済みの図(diagrams)を、mermaidのコードブロックの代わりに置く。表示は、コードブロックごとの選択(show=)に従う。
+// 描けなかった図は、選択に関わらず、理由を添えてコードを残す
+function remarkMermaidDiagrams() {
+  return (tree: MdastRoot, file: { data: object }): void => {
+    const diagrams = (file.data as { diagrams?: DiagramMap }).diagrams;
+    if (diagrams === undefined) {
+      return;
+    }
+    visit(tree, 'code', (node: Code, index, parent) => {
+      const view = diagramViewOf(node.meta);
+      const outcome = isMermaidLanguage(node.lang) && view !== 'code' ? diagrams.get(node.value) : undefined;
+      if (outcome === undefined || parent === undefined || index === undefined) {
+        return undefined;
+      }
+      const figure = outcome.ok ? diagramFigure(outcome) : null;
+      let replacement: RootContent[];
+      if (figure === null) {
+        replacement = [failureNote(outcome.ok ? '図の大きさを取得できません' : outcome.message), node];
+      } else {
+        // 両方のときは、エディタと同じ並び(コードの下に図)にする
+        replacement = view === 'both' ? [node, figure] : [figure];
+      }
+      parent.children.splice(index, 1, ...(replacement as typeof parent.children));
+      return [SKIP, index + replacement.length];
+    });
+  };
+}
+
+// 長すぎるコードは色分けの対象から外す(rehype-highlightは、no-highlightクラスのコードを飛ばす)
+function rehypeSkipHugeCode() {
+  return (tree: HastRoot): void => {
+    visit(tree, 'element', (node) => {
+      if (node.tagName === 'pre') {
+        const code = node.children.find((child): child is HastElement => child.type === 'element' && child.tagName === 'code');
+        if (code !== undefined && toString(code).length > MAX_HIGHLIGHT_CHARS) {
+          const classes = Array.isArray(code.properties['className']) ? code.properties['className'] : [];
+          code.properties['className'] = [...classes, 'no-highlight'];
+        }
+      }
+    });
+  };
+}
+
 const processor = unified()
   .use(remarkParse)
   .use(remarkFrontmatter, ['yaml'])
   .use(remarkGfm)
   .use(remarkBreaks)
   .use(remarkNeutralizeRawContent)
+  .use(remarkMermaidDiagrams)
   .use(remarkRehype)
   .use(rehypeNeutralizeUrls)
+  .use(rehypeSkipHugeCode)
+  // 言語名が登録されていないコードは、そのまま表示される(エラーにならない)
+  .use(rehypeHighlight, { languages: allLanguages, plainText: PLAIN_TEXT_LANGUAGES })
   .use(rehypeStringify)
   .freeze();
 
@@ -153,16 +239,27 @@ export interface RenderedMarkdown {
   readonly bodyHtml: string;
 }
 
-export function renderMarkdown(markdown: string, assets?: MarkdownAssets): RenderedMarkdown {
+export function renderMarkdown(markdown: string, assets?: MarkdownAssets, diagrams?: DiagramMap): RenderedMarkdown {
   const mdast = processor.parse(markdown);
   const title = extractTitle(mdast);
-  const hast = processor.runSync(mdast, { data: { markdownAssets: assets } }) as HastRoot;
+  const hast = processor.runSync(mdast, { data: { markdownAssets: assets, diagrams } }) as HastRoot;
   return { title, bodyHtml: String(processor.stringify(hast)) };
 }
 
+/** Markdownの中の、図にするMermaidのコード(コードブロックの中身)。文書の上から順に、同じ内容は1つにまとめる。コードだけを表示する指定(show=code)のものは、図にしないため含めない */
+export function extractMermaidSources(markdown: string): string[] {
+  const sources = new Set<string>();
+  visit(processor.parse(markdown), 'code', (node: Code) => {
+    if (isMermaidLanguage(node.lang) && diagramViewOf(node.meta) !== 'code') {
+      sources.add(node.value);
+    }
+  });
+  return [...sources];
+}
+
 // PDF化するHTML全体。メタタグのCSPは、Chromium側の通信遮断に加えた二重の防御
-export function buildDocumentHtml(markdown: string, css: string, assets?: MarkdownAssets): string {
-  const { title, bodyHtml } = renderMarkdown(markdown, assets);
+export function buildDocumentHtml(markdown: string, css: string, assets?: MarkdownAssets, diagrams?: DiagramMap): string {
+  const { title, bodyHtml } = renderMarkdown(markdown, assets, diagrams);
   return [
     '<!doctype html>',
     '<html lang="ja"><head><meta charset="utf-8">',

@@ -1,5 +1,7 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { buildDocumentHtml, renderMarkdown, type MarkdownAssets } from './markdownToHtml.js';
+import type { DiagramOutcome } from '../shared/mermaid.js';
+import { buildDocumentHtml, extractMermaidSources, renderMarkdown, type DiagramMap, type MarkdownAssets } from './markdownToHtml.js';
 
 const body = (markdown: string): string => renderMarkdown(markdown).bodyHtml;
 
@@ -16,7 +18,7 @@ describe('renderMarkdown', () => {
     expect(html).toContain('<h1>見出し</h1>');
     expect(html).toContain('<strong>太字</strong>');
     expect(html).toContain('<code>code</code>');
-    expect(html).toContain('<pre><code class="language-python">print(1)\n</code></pre>');
+    expect(html).toContain('<pre><code class="hljs language-python">');
   });
 
   it('山括弧で囲まれた日本語(エラー一覧表など)は文字として残る', () => {
@@ -51,7 +53,8 @@ describe('renderMarkdown', () => {
   describe('front matter', () => {
     it('YAMLコードブロックとして内容を残す', () => {
       const html = body('---\ntitle: T\ntags: [a, b]\n---\n\n本文');
-      expect(html).toContain('<pre><code class="language-yaml">title: T\ntags: [a, b]\n</code></pre>');
+      expect(html).toContain('<pre><code class="hljs language-yaml">');
+      expect(html).toContain('<span class="hljs-attr">title:</span> <span class="hljs-string">T</span>');
       expect(html).toContain('<p>本文</p>');
     });
   });
@@ -153,6 +156,242 @@ describe('renderMarkdown', () => {
   it('最初のH1をタイトルにする。無ければ「無題」', () => {
     expect(renderMarkdown('本文\n\n# 取扱説明書 *第2版*').title).toBe('取扱説明書 第2版');
     expect(renderMarkdown('## 小見出しだけ').title).toBe('無題');
+  });
+});
+
+describe('コードブロックの色分け', () => {
+  it('言語名に応じて、構文ごとにクラスが付く(Python)', () => {
+    const html = body('```python\ndef greet(name):\n    # 挨拶\n    return "こんにちは"\n```');
+    expect(html).toContain('<span class="hljs-keyword">def</span>');
+    expect(html).toContain('<span class="hljs-title function_">greet</span>');
+    expect(html).toContain('<span class="hljs-comment"># 挨拶</span>');
+    expect(html).toContain('<span class="hljs-string">"こんにちは"</span>');
+  });
+
+  // 登録されている言語は、一部ではなく、ほぼすべて(エディタで選べる言語に加え、一般的な言語を含む)
+  it.each([
+    ['javascript', 'const x = 1;'],
+    ['typescript', 'const x: number = 1;'],
+    ['bash', 'echo "hi" && ls -la'],
+    ['sql', 'SELECT id FROM users WHERE id = 1;'],
+    ['json', '{"a": 1, "b": true}'],
+    ['yaml', 'key: value\nlist:\n  - 1'],
+    ['html', '<div class="a">x</div>'],
+    ['css', '.a { color: red; }'],
+    ['java', 'public class A { int x = 1; }'],
+    ['csharp', 'public class A { int x = 1; }'],
+    ['cpp', '#include <stdio.h>\nint main() { return 0; }'],
+    ['go', 'func main() { println("hi") }'],
+    ['rust', 'fn main() { let x = 1; }'],
+    ['ruby', 'def hello\n  puts "hi"\nend'],
+    ['php', '<?php echo "hi"; ?>'],
+    ['kotlin', 'fun main() { println("hi") }'],
+    ['swift', 'let x: Int = 1'],
+    ['powershell', 'Get-ChildItem -Path . | Where-Object { $_.Length -gt 1 }'],
+    ['dockerfile', 'FROM node:24\nRUN npm ci'],
+    ['ini', '[server]\nport = 8080'],
+    ['diff', '--- a\n+++ b\n-old\n+new'],
+    ['markdown', '# 見出し\n\n**太字**'],
+    ['perl', 'my $x = 1; print $x;'],
+    ['lua', 'local x = 1\nprint(x)'],
+  ])('%s のコードに、色分けのクラスが付く', (language, code) => {
+    expect(body('```' + language + '\n' + code + '\n```')).toMatch(/<span class="hljs-/);
+  });
+
+  it('言語名の別名(py・js・sh・c#など)も色分けする', () => {
+    for (const alias of ['py', 'js', 'ts', 'sh', 'yml', 'cs', 'c++', 'golang', 'rs']) {
+      expect(body('```' + alias + '\nx = 1\n```'), alias).toContain(`language-${alias}`);
+    }
+    expect(body('```py\ndef f(): pass\n```')).toContain('hljs-keyword');
+    expect(body('```sh\necho hi\n```')).toContain('hljs-built_in');
+  });
+
+  it('言語名の無いコード・テキスト・未知の言語は、色分けせず、エラーにもならない', () => {
+    for (const fence of ['```\nplain text\n```', '```text\nplain text\n```', '```txt\nplain text\n```', '```no-such-language\nplain text\n```']) {
+      const html = body(fence);
+      expect(html).toContain('plain text');
+      expect(html).not.toContain('hljs-');
+    }
+  });
+
+  it('コードの中のHTMLは、実行も解釈もされず、文字として表示される', () => {
+    const html = body('```html\n<script>alert(1)</script><img src=x onerror=alert(1)>\n```');
+    expect(html).not.toContain('<script');
+    expect(html).not.toContain('<img');
+    expect(html).toContain('&#x3C;');
+  });
+
+  it('色分けしても、コードの文字は1文字も変わらない', () => {
+    const code = 'def f(x):\n    return x < 2 and "a&b" or \'c\'\n';
+    const html = body('```python\n' + code + '```');
+    const text = html
+      .replace(/<[^>]+>/g, '')
+      .replace(/&#x3C;/g, '<')
+      .replace(/&#x26;/g, '&')
+      .replace(/&#x22;/g, '"')
+      .replace(/&#x27;/g, "'");
+    expect(text).toContain(code);
+  });
+
+  it('長すぎるコードは、色分けせずにそのまま表示する', () => {
+    const html = body('```python\n' + 'x = 1\n'.repeat(20_000) + '```');
+    expect(html).not.toContain('hljs-');
+    expect(html).toContain('x = 1');
+  });
+
+  it('インラインコードは、色分けしない', () => {
+    expect(body('`def f()`')).toBe('<p><code>def f()</code></p>');
+  });
+
+  it('PDFのHTMLには、色分けのクラスに対応するCSSが含まれる', () => {
+    const css = readFileSync(new URL('../shared/document.css', import.meta.url), 'utf8');
+    for (const name of ['hljs-keyword', 'hljs-string', 'hljs-comment', 'hljs-number', 'hljs-title']) {
+      expect(css, name).toContain(`.${name}`);
+    }
+  });
+});
+
+describe('Mermaidの図', () => {
+  const svg = '<svg id="m" width="100%" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 80"><g></g></svg>';
+  const flow = 'graph TD\n  A --> B';
+  const diagrams = (entries: [string, DiagramOutcome][]): DiagramMap => new Map(entries);
+
+  describe('extractMermaidSources', () => {
+    it('mermaidのコードブロックだけを、文書の上から順に取り出す', () => {
+      const markdown = ['```python', 'x = 1', '```', '', '```mermaid', 'graph TD\n  A --> B', '```', '', '```Mermaid', 'pie\n  "a": 1', '```'].join('\n');
+      expect(extractMermaidSources(markdown)).toEqual(['graph TD\n  A --> B', 'pie\n  "a": 1']);
+    });
+
+    it('同じ内容の図は1つにまとめる', () => {
+      const block = '```mermaid\n' + flow + '\n```';
+      expect(extractMermaidSources(`${block}\n\n本文\n\n${block}`)).toEqual([flow]);
+    });
+
+    it('引用・箇条書きの中の図も取り出す。mermaid以外・言語なしは対象外', () => {
+      const markdown = ['> ```mermaid', '> graph LR', '> ```', '', '- ```mermaid', '  pie', '  ```', '', '```', 'graph TD', '```', '', '    mermaid風のインデントコード'].join('\n');
+      expect(extractMermaidSources(markdown)).toEqual(['graph LR', 'pie']);
+    });
+
+    it('図が無ければ空', () => {
+      expect(extractMermaidSources('# 見出し\n\n```python\nx\n```')).toEqual([]);
+    });
+  });
+
+  describe('描画済みの図を渡した場合', () => {
+    it('コードブロックの代わりに、図(figure/img)を表示する', () => {
+      const html = renderMarkdown('```mermaid\n' + flow + '\n```', undefined, diagrams([[flow, { ok: true, svg }]])).bodyHtml;
+      expect(html).toContain('<figure class="mermaid-diagram">');
+      expect(html).toMatch(/<img src="data:image\/svg\+xml;base64,[A-Za-z0-9+/=]+" width="120" height="80" alt="Mermaidの図">/);
+      expect(html).not.toContain('<pre>');
+      expect(html).not.toContain('graph TD');
+    });
+
+    it('埋め込んだSVGは、幅・高さが明示され、元の内容が保たれる', () => {
+      const html = renderMarkdown('```mermaid\n' + flow + '\n```', undefined, diagrams([[flow, { ok: true, svg }]])).bodyHtml;
+      const encoded = /base64,([A-Za-z0-9+/=]+)"/.exec(html)?.[1] ?? '';
+      const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+      expect(decoded).toContain('<svg width="120" height="80" id="m"');
+      expect(decoded).toContain('<g></g></svg>');
+    });
+
+    it('同じ図が複数あっても、それぞれ図になる', () => {
+      const block = '```mermaid\n' + flow + '\n```';
+      const html = renderMarkdown(`${block}\n\n間\n\n${block}`, undefined, diagrams([[flow, { ok: true, svg }]])).bodyHtml;
+      expect(html.match(/<figure/g)).toHaveLength(2);
+    });
+
+    it('描けなかった図は、理由を添えて、コードのまま表示する(PDFの生成は続ける)', () => {
+      const html = renderMarkdown('```mermaid\n' + flow + '\n```', undefined, diagrams([[flow, { ok: false, message: 'Parse error on line 2:' }]])).bodyHtml;
+      expect(html).toContain('<p class="diagram-error">Mermaidの図を描画できなかったため、コードのまま表示します(Parse error on line 2:)</p>');
+      expect(html).toContain('<pre><code class="language-mermaid">graph TD');
+      expect(html).not.toContain('<figure');
+    });
+
+    it('図の大きさを読み取れないSVGは、描けなかった図として扱う', () => {
+      const html = renderMarkdown('```mermaid\n' + flow + '\n```', undefined, diagrams([[flow, { ok: true, svg: '<svg></svg>' }]])).bodyHtml;
+      expect(html).toContain('diagram-error');
+      expect(html).toContain('<pre>');
+    });
+
+    it('描けなかった図の理由に含まれるHTMLは、文字として表示される', () => {
+      const html = renderMarkdown('```mermaid\n' + flow + '\n```', undefined, diagrams([[flow, { ok: false, message: '<img src=x onerror=alert(1)>' }]])).bodyHtml;
+      expect(html).not.toContain('<img');
+      expect(html).toContain('&#x3C;img src=x onerror=alert(1)>');
+    });
+
+    it('結果の無い図(渡されたものに含まれない図)と、mermaid以外のコードは、そのまま', () => {
+      const html = renderMarkdown('```mermaid\npie\n```\n\n```python\nx = 1\n```', undefined, diagrams([[flow, { ok: true, svg }]])).bodyHtml;
+      expect(html).not.toContain('<figure');
+      expect(html).toContain('language-mermaid');
+      expect(html).toContain('language-python');
+    });
+  });
+
+  describe('表示の選択(show=)', () => {
+    const block = (meta: string): string => '```mermaid' + meta + '\n' + flow + '\n```';
+    const render = (meta: string): string => renderMarkdown(block(meta), undefined, diagrams([[flow, { ok: true, svg }]])).bodyHtml;
+
+    it('書かなければ「図のみ」(show=diagram も同じ)', () => {
+      for (const html of [render(''), render(' show=diagram')]) {
+        expect(html).toContain('<figure');
+        expect(html).not.toContain('<pre>');
+      }
+    });
+
+    it('show=code は、図にせず、コードだけを表示する', () => {
+      const html = render(' show=code');
+      expect(html).not.toContain('<figure');
+      expect(html).not.toContain('<img');
+      expect(html).toContain('<pre><code class="language-mermaid">graph TD');
+    });
+
+    it('show=both は、コードの下に図を表示する', () => {
+      const html = render(' show=both');
+      expect(html).toContain('<pre><code class="language-mermaid">graph TD');
+      expect(html).toContain('<figure class="mermaid-diagram">');
+      expect(html.indexOf('<pre>')).toBeLessThan(html.indexOf('<figure'));
+    });
+
+    it('読めない選択は、既定(図のみ)になる', () => {
+      const html = render(' show=everything');
+      expect(html).toContain('<figure');
+      expect(html).not.toContain('<pre>');
+    });
+
+    it('ほかのメタ情報があっても、選択は効く', () => {
+      expect(render(' title="a" show=both')).toContain('<pre>');
+    });
+
+    it('描けなかった図は、選択に関わらず、理由とコードを表示する(コードのみを除く)', () => {
+      for (const meta of ['', ' show=both']) {
+        const html = renderMarkdown(block(meta), undefined, diagrams([[flow, { ok: false, message: '誤り' }]])).bodyHtml;
+        expect(html).toContain('diagram-error');
+        expect(html).toContain('<pre>');
+        expect(html).not.toContain('<figure');
+      }
+      const codeOnly = renderMarkdown(block(' show=code'), undefined, diagrams([[flow, { ok: false, message: '誤り' }]])).bodyHtml;
+      expect(codeOnly).not.toContain('diagram-error');
+      expect(codeOnly).toContain('<pre>');
+    });
+
+    it('同じ図でも、ブロックごとの選択に従う', () => {
+      const html = renderMarkdown([block(''), block(' show=code'), block(' show=both')].join('\n\n'), undefined, diagrams([[flow, { ok: true, svg }]])).bodyHtml;
+      expect(html.match(/<figure/g)).toHaveLength(2);
+      expect(html.match(/<pre>/g)).toHaveLength(2);
+    });
+
+    it('extractMermaidSources: コードのみのブロックは、描画の対象に含めない', () => {
+      expect(extractMermaidSources(block(' show=code'))).toEqual([]);
+      expect(extractMermaidSources(block(' show=both'))).toEqual([flow]);
+      // 同じ図が、コードのみと図のみの両方にあれば、図のために1つ描く
+      expect(extractMermaidSources([block(' show=code'), block('')].join('\n\n'))).toEqual([flow]);
+    });
+  });
+
+  it('図を渡さなければ、mermaidのコードは、色分けされず、そのままコードとして表示される', () => {
+    const html = body('```mermaid\n' + flow + '\n```');
+    expect(html).toContain('<pre><code class="language-mermaid">graph TD');
+    expect(html).not.toContain('hljs-');
   });
 });
 

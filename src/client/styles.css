@@ -394,3 +394,52 @@ body {
   padding: 0;
   list-style: none;
 }
+
+/* Mermaidのコードブロック: コードの下に、描画した図を表示する */
+.mermaid-preview {
+  padding: 8px 12px;
+  border-top: 1px dashed var(--border);
+  text-align: center;
+}
+.mermaid-image {
+  max-width: 100%;
+  height: auto;
+}
+.mermaid-status,
+.mermaid-error {
+  margin: 0;
+  font-size: 12px;
+  text-align: left;
+}
+.mermaid-status {
+  color: var(--muted);
+}
+.mermaid-error {
+  color: #b91c1c;
+}
+
+/* Mermaidのコードブロック: PDFにどれを出すか(図のみ・コードのみ・両方)の選択 */
+.mermaid-view {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 16px;
+  margin: 0;
+  padding: 6px 12px;
+  border: 0;
+  border-top: 1px dashed var(--border);
+  background: #f9fafb;
+  font-size: 13px;
+}
+.mermaid-view legend {
+  float: left;
+  padding: 0;
+  margin-right: 16px;
+  color: var(--muted);
+}
+.mermaid-view label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}

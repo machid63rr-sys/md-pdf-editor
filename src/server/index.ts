@@ -8,7 +8,8 @@ import { selfCheck } from './selfCheck.js';
 async function main(): Promise<void> {
   const config = loadConfig();
   const css = readFileSync(new URL('./document.css', import.meta.url), 'utf8');
-  const renderer = createPdfRenderer({ chromiumPath: config.chromiumPath, timeoutMs: config.pdfTimeoutMs });
+  const mermaidScript = readFileSync(new URL('./mermaid.min.js', import.meta.url), 'utf8');
+  const renderer = createPdfRenderer({ chromiumPath: config.chromiumPath, timeoutMs: config.pdfTimeoutMs, mermaidScript });
 
   // 壊れた状態で起動し続けないよう、起動時に実際にPDFを1本生成して確認する
   const { chromium } = await selfCheck(renderer, css);

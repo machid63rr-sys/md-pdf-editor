@@ -34,7 +34,11 @@ beforeAll(async () => {
   if (!existsSync(join(clientDir, 'index.html'))) {
     throw new Error('dist/client がありません。先に `npm run build` を実行してください。');
   }
-  const renderer = createPdfRenderer({ chromiumPath: process.env['CHROMIUM_PATH'] ?? '/usr/bin/chromium', timeoutMs: 60_000 });
+  const renderer = createPdfRenderer({
+    chromiumPath: process.env['CHROMIUM_PATH'] ?? '/usr/bin/chromium',
+    timeoutMs: 60_000,
+    mermaidScript: readFileSync(join(root, 'node_modules/mermaid/dist/mermaid.min.js'), 'utf8'),
+  });
   const app = createApp({ maxMarkdownBytes: 5 * 1024 * 1024, renderer, css, clientDir, chromiumVersion: 'e2e' });
   await new Promise<void>((resolve) => {
     server = app.listen(0, '127.0.0.1', () => resolve());
@@ -1185,5 +1189,244 @@ describe('画面操作(実ブラウザ)', () => {
     await popup.waitForFunction(() => location.href.startsWith('blob:'), { timeout: 60_000 });
     expect(popup.url()).toMatch(/^blob:http:\/\/127\.0\.0\.1:\d+\//);
     await popup.close();
+  });
+});
+
+describe('コードブロックの色分けとMermaidの図(実ブラウザ)', () => {
+  const FLOW = 'graph TD\n  A[開始] --> B{判定}\n  B -->|はい| C[処理]\n  B -->|いいえ| D[終了]';
+
+  // 色分けされた(クラスの付いた)文字の数。コードブロックごと
+  const coloredSpans = (): Promise<number[]> =>
+    page.$$eval('.cm-editor', (editors) => editors.map((editor) => editor.querySelectorAll('.cm-line span[class]').length));
+
+  const diagramLoaded = (): Promise<unknown> =>
+    page.waitForFunction(() => {
+      const image = document.querySelector('.mermaid-image') as HTMLImageElement | null;
+      return image !== null && image.complete && image.naturalWidth > 0;
+    });
+
+  it('Python・JavaScriptなど、言語名のあるコードブロックは、エディタ上で色分けされる', async () => {
+    await openEditor('```python\ndef f(x):\n    return "a"\n```\n\n```js\nconst x = 1; // メモ\n```');
+    await page.waitForFunction(() => [...document.querySelectorAll('.cm-editor')].every((editor) => editor.querySelectorAll('.cm-line span[class]').length > 0));
+    expect((await coloredSpans()).every((count) => count > 0)).toBe(true);
+  });
+
+  it('エディタの言語一覧に無い言語(Ruby・PHP・Kotlin・PowerShellなど)も、色分けされる', async () => {
+    const samples: [string, string][] = [
+      ['ruby', 'def hello(name)\n  puts "hi"\nend'],
+      ['php', '<?php\necho "hi";'],
+      ['kotlin', 'fun main() {\n  println("hi")\n}'],
+      ['powershell', 'Get-ChildItem -Path . | Where-Object { $_.Length -gt 1 }'],
+      ['dockerfile', 'FROM node:24\nRUN npm ci'],
+      ['toml', '[server]\nport = 8080'],
+      ['swift', 'let x: Int = 1'],
+      ['lua', 'local x = 1\nprint(x)'],
+      ['perl', 'my $x = 1; print $x;'],
+    ];
+    await openEditor(samples.map(([language, code]) => '```' + language + '\n' + code + '\n```').join('\n\n'));
+    await page.waitForFunction(
+      (count) => {
+        const editors = [...document.querySelectorAll('.cm-editor')];
+        return editors.length === count && editors.every((editor) => editor.querySelectorAll('.cm-line span[class]').length > 0);
+      },
+      { timeout: 30_000 },
+      samples.length,
+    );
+    expect((await coloredSpans()).every((count) => count > 0)).toBe(true);
+  });
+
+  it('言語名の無いコードブロック・テキストは、色分けされない', async () => {
+    await openEditor('```\nplain text\n```\n\n```txt\nplain text\n```');
+    await page.waitForFunction(() => document.querySelectorAll('.cm-editor').length === 2);
+    expect(await coloredSpans()).toEqual([0, 0]);
+  });
+
+  it('Mermaidのコードブロックは、コードの下に図が描画される(コードも編集できる)', async () => {
+    await openEditor(`# 図\n\n\`\`\`mermaid\n${FLOW}\n\`\`\``);
+    await diagramLoaded();
+
+    expect(await page.$eval('.mermaid-block .cm-content', (element) => (element as HTMLElement).innerText)).toContain('graph TD');
+    expect(await page.$('.mermaid-error')).toBeNull();
+    // 図は画像として表示されるため、図の中の文字は、ページの文字には混ざらない
+    const size = await page.$eval('.mermaid-image', (element) => ({ width: (element as HTMLImageElement).naturalWidth, height: (element as HTMLImageElement).naturalHeight }));
+    expect(size.width).toBeGreaterThan(100);
+    expect(size.height).toBeGreaterThan(100);
+    await shot('18-mermaid-editor');
+    expect(consoleErrors).toEqual([]);
+  });
+
+  it('図を表示しても、Markdownの本文は変わらない(図のSVGは、Markdownに入らない)', async () => {
+    const markdown = `# 図\n\n\`\`\`mermaid\n${FLOW}\n\`\`\`\n\n本文`;
+    await openEditor(markdown);
+    await diagramLoaded();
+    await clickButton('Markdown');
+    expect(await sourceValue()).toBe(markdown);
+  });
+
+  it('Mermaidのコードを編集すると、図が更新され、Markdownにはコードだけが反映される', async () => {
+    await openEditor('```mermaid\ngraph TD\n  A --> B\n```');
+    await diagramLoaded();
+    const before = await page.$eval('.mermaid-image', (element) => (element as HTMLImageElement).src);
+
+    await page.click('.mermaid-block .cm-content');
+    await page.keyboard.down('Control');
+    await page.keyboard.press('a');
+    await page.keyboard.up('Control');
+    await page.keyboard.type('graph LR; X[新しい図]-->Y; Y-->Z');
+    await page.waitForFunction((previous) => (document.querySelector('.mermaid-image') as HTMLImageElement | null)?.src !== previous, {}, before);
+    await diagramLoaded();
+
+    await clickButton('Markdown');
+    const edited = await sourceValue();
+    expect(edited).toContain('graph LR; X[新しい図]-->Y; Y-->Z');
+    expect(edited).not.toContain('<svg');
+    expect(edited).not.toContain('data:image');
+  });
+
+  it('構文が誤っているMermaidは、図の代わりに理由を表示し、直すと図になる', async () => {
+    await openEditor('```mermaid\ngraph TD\n  A[ --> B\n```');
+    await page.waitForSelector('.mermaid-error');
+    expect(await page.$eval('.mermaid-error', (element) => (element as HTMLElement).innerText)).toContain('図を描画できません');
+    expect(await page.$('.mermaid-image')).toBeNull();
+    await shot('19-mermaid-error');
+
+    await page.click('.mermaid-block .cm-content');
+    await page.keyboard.down('Control');
+    await page.keyboard.press('a');
+    await page.keyboard.up('Control');
+    await page.keyboard.type('graph TD; A-->B');
+    await diagramLoaded();
+    expect(await page.$('.mermaid-error')).toBeNull();
+  });
+
+  it('言語をMermaid以外に切り替えると、図は表示されず、通常のコードブロックになる', async () => {
+    await openEditor('```mermaid\ngraph TD\n  A --> B\n```');
+    await diagramLoaded();
+    // 言語の選択は、標準の<select>ではなく、独自のドロップダウン
+    const trigger = await page.evaluateHandle(() => [...document.querySelectorAll('[role="combobox"]')].find((element) => element.textContent?.includes('Mermaid')) ?? null);
+    await (trigger.asElement() as ElementHandle<Element>).click();
+    await page.waitForSelector('[role="option"]');
+    const option = await page.evaluateHandle(() => [...document.querySelectorAll('[role="option"]')].find((element) => element.textContent?.includes('Python')) ?? null);
+    await (option.asElement() as ElementHandle<Element>).click();
+    await page.waitForFunction(() => document.querySelector('.mermaid-block') === null);
+    expect(await page.$('.mermaid-image')).toBeNull();
+    await clickButton('Markdown');
+    expect(await sourceValue()).toContain('```python');
+  });
+
+  describe('PDFでの表示の選択', () => {
+    const radioState = (): Promise<string[]> =>
+      page.$$eval('.mermaid-view input[type="radio"]', (inputs) => inputs.filter((input) => (input as HTMLInputElement).checked).map((input) => input.parentElement?.textContent?.trim() ?? ''));
+
+    const choose = async (label: string): Promise<void> => {
+      const handle = await page.evaluateHandle(
+        (text) => [...document.querySelectorAll('.mermaid-view label')].find((element) => element.textContent?.includes(text)) ?? null,
+        label,
+      );
+      await (handle.asElement() as ElementHandle<Element>).click();
+    };
+
+    it('書かなければ「図のみ」が選ばれていて、Markdownは変わらない', async () => {
+      const markdown = `\`\`\`mermaid\n${FLOW}\n\`\`\``;
+      await openEditor(markdown);
+      await diagramLoaded();
+      expect(await radioState()).toEqual(['図のみ']);
+      await clickButton('Markdown');
+      expect(await sourceValue()).toBe(markdown);
+    });
+
+    it('「コードと図」「コードのみ」を選ぶと、Markdownの言語名の後ろに show= が書かれ、図のみに戻すと消える', async () => {
+      await openEditor(`\`\`\`mermaid\n${FLOW}\n\`\`\``);
+      await diagramLoaded();
+
+      await choose('コードと図');
+      expect(await radioState()).toEqual(['コードと図']);
+      await clickButton('Markdown');
+      expect(await sourceValue()).toBe(`\`\`\`mermaid show=both\n${FLOW}\n\`\`\``);
+
+      await clickButton('プレビュー');
+      await diagramLoaded();
+      expect(await radioState()).toEqual(['コードと図']);
+      await choose('コードのみ');
+      await clickButton('Markdown');
+      expect(await sourceValue()).toBe(`\`\`\`mermaid show=code\n${FLOW}\n\`\`\``);
+
+      await clickButton('プレビュー');
+      await diagramLoaded();
+      await choose('図のみ');
+      await clickButton('Markdown');
+      expect(await sourceValue()).toBe(`\`\`\`mermaid\n${FLOW}\n\`\`\``);
+    });
+
+    it('Markdownに show=both と書いてあれば、取り込み時に反映され、編集しても保たれる', async () => {
+      await openEditor(`\`\`\`mermaid show=both\n${FLOW}\n\`\`\``);
+      await diagramLoaded();
+      expect(await radioState()).toEqual(['コードと図']);
+
+      await page.click('.mermaid-block .cm-content');
+      await page.keyboard.down('Control');
+      await page.keyboard.press('End');
+      await page.keyboard.up('Control');
+      await page.keyboard.type('\n  D --> E');
+      await clickButton('Markdown');
+      const edited = await sourceValue();
+      expect(edited).toContain('```mermaid show=both');
+      expect(edited).toContain('D --> E');
+    });
+
+    it('ブロックごとに別々に選べる', async () => {
+      await openEditor(`\`\`\`mermaid\ngraph TD; A-->B\n\`\`\`\n\n\`\`\`mermaid\ngraph TD; C-->D\n\`\`\``);
+      await page.waitForFunction(() => document.querySelectorAll('.mermaid-image').length === 2);
+      await page.evaluate(() => {
+        const second = [...document.querySelectorAll('.mermaid-block')][1];
+        const both = [...(second?.querySelectorAll('.mermaid-view label') ?? [])].find((label) => label.textContent?.includes('コードと図')) as HTMLElement;
+        both.click();
+      });
+      await clickButton('Markdown');
+      expect(await sourceValue()).toBe('```mermaid\ngraph TD; A-->B\n```\n\n```mermaid show=both\ngraph TD; C-->D\n```');
+    });
+
+    it('選んだとおりにPDFが作られる(コードのみ: 図は出ず、コードが出る)', async () => {
+      await openEditor(`\`\`\`mermaid show=code\n${FLOW}\n\`\`\``);
+      await diagramLoaded();
+      await clickButton('出力先フォルダを選択');
+      await page.waitForFunction(
+        () => !([...document.querySelectorAll('button')].find((b) => b.textContent?.includes('選んだフォルダへ'))?.disabled ?? true),
+      );
+      await clickButton('選んだフォルダへ');
+      await page.waitForSelector('.notice-success', { timeout: 60_000 });
+      const bytes = await page.evaluate(async () => {
+        const dir = await navigator.storage.getDirectory();
+        const file = await (await dir.getFileHandle('document.pdf')).getFile();
+        return [...new Uint8Array(await file.arrayBuffer())];
+      });
+      const path = join(mkdtempSync(join(tmpdir(), 'md-pdf-editor-view-')), 'out.pdf');
+      writeFileSync(path, Buffer.from(bytes));
+      expect(execFileSync('pdftotext', [path, '-'], { encoding: 'utf8' })).toContain('graph TD');
+    });
+  });
+
+  it('PDFには、Mermaidの図(日本語の文字つき)が入り、コードはPDFに出ない', async () => {
+    await openEditor(`# 図のある文書\n\n\`\`\`python\ndef f():\n    return 1\n\`\`\`\n\n\`\`\`mermaid\n${FLOW}\n\`\`\``);
+    await diagramLoaded();
+    await clickButton('出力先フォルダを選択');
+    await page.waitForFunction(
+      () => !([...document.querySelectorAll('button')].find((b) => b.textContent?.includes('選んだフォルダへ'))?.disabled ?? true),
+    );
+    await clickButton('選んだフォルダへ');
+    await page.waitForSelector('.notice-success', { timeout: 60_000 });
+
+    const bytes = await page.evaluate(async () => {
+      const dir = await navigator.storage.getDirectory();
+      const file = await (await dir.getFileHandle('document.pdf')).getFile();
+      return [...new Uint8Array(await file.arrayBuffer())];
+    });
+    const path = join(mkdtempSync(join(tmpdir(), 'md-pdf-editor-mermaid-')), 'out.pdf');
+    writeFileSync(path, Buffer.from(bytes));
+    const text = execFileSync('pdftotext', [path, '-'], { encoding: 'utf8' });
+    for (const label of ['図のある文書', 'def f():', '開始', '判定', '処理', '終了']) {
+      expect(text, label).toContain(label);
+    }
+    expect(text).not.toContain('graph TD');
   });
 });

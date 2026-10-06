@@ -1,6 +1,6 @@
 import express, { type ErrorRequestHandler, type Express, type NextFunction, type Request, type Response } from 'express';
 import { prepareHtmlForPdf } from './htmlDocument.js';
-import { buildDocumentHtml, type MarkdownAssets } from './markdownToHtml.js';
+import { buildDocumentHtml, extractMermaidSources, type DiagramMap, type MarkdownAssets } from './markdownToHtml.js';
 import { PdfRenderError, type PdfRenderer } from './pdf.js';
 
 export interface AppDependencies {
@@ -52,6 +52,9 @@ const SOURCE_LABEL = { markdown: 'Markdown', html: 'HTML' } as const;
 const MAX_ASSET_FILES = 1000;
 const MAX_PATH_LENGTH = 1000;
 
+// 1つの文書で描画するMermaidの図の数の上限(それを超える図は、コードのまま表示する)
+const MAX_DIAGRAMS = 30;
+
 const invalid = (message: string): ApiError => new ApiError(400, 'invalid_request', message);
 
 function parseAssets(baseDir: unknown, assets: unknown): MarkdownAssets | undefined {
@@ -95,6 +98,18 @@ function parseSource(body: unknown, maxBytes: number): PdfSource {
   return parsedAssets === undefined ? { kind, text } : { kind, text, assets: parsedAssets };
 }
 
+// Markdownの中のMermaidの図を描画する。図が無ければ、ブラウザを起動しない
+async function drawDiagrams(renderer: PdfRenderer, markdown: string): Promise<DiagramMap | undefined> {
+  const sources = extractMermaidSources(markdown);
+  if (sources.length === 0) {
+    return undefined;
+  }
+  const drawn = await renderer.drawDiagrams(sources.slice(0, MAX_DIAGRAMS));
+  return new Map(
+    sources.map((source, index) => [source, drawn[index] ?? { ok: false, message: `図が多すぎるため描画しません(上限 ${MAX_DIAGRAMS} 個)` }]),
+  );
+}
+
 export function createApp(deps: AppDependencies): Express {
   const app = express();
   app.disable('x-powered-by');
@@ -112,7 +127,7 @@ export function createApp(deps: AppDependencies): Express {
     const source = parseSource(req.body, deps.maxMarkdownBytes);
     const pdf =
       source.kind === 'markdown'
-        ? await deps.renderer.render(buildDocumentHtml(source.text, deps.css, source.assets))
+        ? await deps.renderer.render(buildDocumentHtml(source.text, deps.css, source.assets, await drawDiagrams(deps.renderer, source.text)))
         : await deps.renderer.render(prepareHtmlForPdf(source.text), { preferCssPageSize: true });
     res.status(200).type('application/pdf').setHeader('Cache-Control', 'no-store');
     res.send(pdf);

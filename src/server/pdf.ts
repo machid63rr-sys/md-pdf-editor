@@ -1,4 +1,5 @@
-import puppeteer, { type Browser } from 'puppeteer-core';
+import puppeteer, { type Browser, type Page } from 'puppeteer-core';
+import { MERMAID_CONFIG, diagramErrorMessage, type DiagramOutcome } from '../shared/mermaid.js';
 import { SerialQueue } from './serialQueue.js';
 
 export class PdfRenderError extends Error {}
@@ -10,12 +11,16 @@ export interface RenderOptions {
 
 export interface PdfRenderer {
   render(html: string, options?: RenderOptions): Promise<Buffer>;
+  // Mermaidの図をSVGにする。結果は入力と同じ順で返し、描けなかった図は、理由つきの失敗にする
+  drawDiagrams(sources: readonly string[]): Promise<DiagramOutcome[]>;
   chromiumVersion(): Promise<string>;
 }
 
 export interface PdfRendererOptions {
   readonly chromiumPath: string;
   readonly timeoutMs: number;
+  // Mermaidの描画スクリプト(mermaid.min.js の中身)
+  readonly mermaidScript: string;
 }
 
 // コンテナ内では非rootでサンドボックスを使えないため --no-sandbox で起動する。
@@ -28,6 +33,39 @@ const FOOTER_TEMPLATE =
   '<span class="pageNumber"></span> / <span class="totalPages"></span></div>';
 
 const messageOf = (cause: unknown): string => (cause instanceof Error ? cause.message : String(cause));
+
+// 外部へは一切通信させない(data: の画像だけ許可する)
+async function blockExternalRequests(page: Page): Promise<void> {
+  await page.setRequestInterception(true);
+  page.on('request', (request) => {
+    const url = request.url();
+    if (url.startsWith('data:') || url === 'about:blank') {
+      void request.continue();
+    } else {
+      void request.abort('blockedbyclient');
+    }
+  });
+}
+
+/*
+ * ブラウザの中で、Mermaidの図を順にSVGにする(page.evaluateで実行するため、外の変数は参照しない)。
+ * 1つの図が失敗しても、ほかの図は描く。
+ */
+async function drawInPage(config: object, sources: string[]): Promise<({ ok: true; svg: string } | { ok: false; error: unknown })[]> {
+  const mermaid = (globalThis as unknown as { mermaid: { initialize(config: object): void; render(id: string, text: string): Promise<{ svg: string }> } })
+    .mermaid;
+  mermaid.initialize(config);
+  const results: ({ ok: true; svg: string } | { ok: false; error: unknown })[] = [];
+  for (const [index, source] of sources.entries()) {
+    try {
+      results.push({ ok: true, svg: (await mermaid.render(`mermaid-${index}`, source)).svg });
+    } catch (error) {
+      // Errorオブジェクトはブラウザの外へ渡せないため、メッセージだけを取り出す
+      results.push({ ok: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return results;
+}
 
 async function closeBrowser(browser: Browser): Promise<void> {
   try {
@@ -48,6 +86,8 @@ export function createPdfRenderer(options: PdfRendererOptions): PdfRenderer {
       headless: true,
       args: LAUNCH_ARGS,
       timeout: options.timeoutMs,
+      // 描画が終わらないとき(巨大な図など)に、いつまでも待たない
+      protocolTimeout: options.timeoutMs,
     });
 
   return {
@@ -59,15 +99,7 @@ export function createPdfRenderer(options: PdfRendererOptions): PdfRenderer {
           const page = await browser.newPage();
           page.setDefaultTimeout(options.timeoutMs);
           await page.setJavaScriptEnabled(false);
-          await page.setRequestInterception(true);
-          page.on('request', (request) => {
-            const url = request.url();
-            if (url.startsWith('data:') || url === 'about:blank') {
-              void request.continue();
-            } else {
-              void request.abort('blockedbyclient');
-            }
-          });
+          await blockExternalRequests(page);
           await page.setContent(html, { waitUntil: 'load', timeout: options.timeoutMs });
           const pdf = await page.pdf({
             format: 'A4',
@@ -82,6 +114,38 @@ export function createPdfRenderer(options: PdfRendererOptions): PdfRenderer {
           return Buffer.from(pdf);
         } catch (cause) {
           throw new PdfRenderError(`PDFの生成に失敗しました: ${messageOf(cause)}`, { cause });
+        } finally {
+          if (browser !== undefined) {
+            await closeBrowser(browser);
+          }
+        }
+      });
+    },
+
+    drawDiagrams(sources: readonly string[]): Promise<DiagramOutcome[]> {
+      if (sources.length === 0) {
+        return Promise.resolve([]);
+      }
+      return queue.run(async () => {
+        let browser: Browser | undefined;
+        try {
+          browser = await launch();
+          const page = await browser.newPage();
+          page.setDefaultTimeout(options.timeoutMs);
+          // 図の描画にはスクリプトが必要なため、このページだけJSを有効にする。
+          // 実行されるのは、こちらが渡すMermaid本体だけ(利用者の文字は、データとして渡す)。
+          // 外部通信は遮断し、図の文字に含まれるHTMLもMermaid側で無効にしている(securityLevel: strict)。
+          // このページは図を作るだけで、PDFにはしない(PDFにするページは、JS無効のまま)
+          await blockExternalRequests(page);
+          await page.setContent('<!doctype html><html><head><meta charset="utf-8"></head><body></body></html>', {
+            waitUntil: 'load',
+            timeout: options.timeoutMs,
+          });
+          await page.addScriptTag({ content: options.mermaidScript });
+          const results = await page.evaluate(drawInPage, MERMAID_CONFIG, [...sources]);
+          return results.map((result): DiagramOutcome => (result.ok ? result : { ok: false, message: diagramErrorMessage(result.error) }));
+        } catch (cause) {
+          throw new PdfRenderError(`図の描画に失敗しました: ${messageOf(cause)}`, { cause });
         } finally {
           if (browser !== undefined) {
             await closeBrowser(browser);
