@@ -8,8 +8,8 @@ const INVALID_CHARACTERS = /[\\/:*?"<>|\u0000-\u001f]/;
 const INVALID_CHARACTERS_GLOBAL = /[\\/:*?"<>|\u0000-\u001f]/g;
 // Windowsの予約名。「con.md」のように拡張子が付いても予約扱いになるため、最初のドットより前で判定する
 const RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
-const SOURCE_EXTENSION = /\.(md|markdown|mdown|txt)$/i;
-// 「.markdown」「.pdf」を付けても255バイトに収まる余裕を持たせる
+const SOURCE_EXTENSION = /\.(md|markdown|mdown|txt|html?|xhtml)$/i;
+// 「.markdown」「.pdf」「.html」を付けても255バイトに収まる余裕を持たせる
 const MAX_BYTES = 200;
 const FALLBACK_NAME = 'document';
 

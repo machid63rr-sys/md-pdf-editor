@@ -9,7 +9,8 @@ import { findBrokenTables } from './tableCheck';
 export type LintCode = 'front-matter' | 'broken-table' | 'unsupported-image' | 'raw-html';
 
 export interface LintWarning {
-  readonly code: LintCode;
+  // 警告の種類。Markdown用はLintCode。HTML用(lintHtml)は別の値も取る
+  readonly code: string;
   readonly message: string;
   // 該当する行番号(1始まり)
   readonly lines: readonly number[];

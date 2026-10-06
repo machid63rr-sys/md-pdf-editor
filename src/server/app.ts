@@ -1,8 +1,10 @@
 import express, { type ErrorRequestHandler, type Express, type NextFunction, type Request, type Response } from 'express';
+import { prepareHtmlForPdf } from './htmlDocument.js';
 import { buildDocumentHtml } from './markdownToHtml.js';
 import { PdfRenderError, type PdfRenderer } from './pdf.js';
 
 export interface AppDependencies {
+  // MarkdownまたはHTMLの最大バイト数(UTF-8換算)
   readonly maxMarkdownBytes: number;
   readonly renderer: PdfRenderer;
   // PDFに適用する共有CSS(プレビューと同じもの)
@@ -37,18 +39,31 @@ function securityHeaders(_req: Request, res: Response, next: NextFunction): void
   next();
 }
 
-function parseMarkdown(body: unknown, maxBytes: number): string {
-  const markdown = (body as { markdown?: unknown } | undefined)?.markdown;
-  if (typeof markdown !== 'string') {
-    throw new ApiError(400, 'invalid_request', 'リクエストは {"markdown": "<文字列>"} の形式で指定してください。');
+interface PdfSource {
+  readonly kind: 'markdown' | 'html';
+  readonly text: string;
+}
+
+const SOURCE_LABEL = { markdown: 'Markdown', html: 'HTML' } as const;
+
+// リクエストは {"markdown": "…"} か {"html": "…"} のどちらか一方
+function parseSource(body: unknown, maxBytes: number): PdfSource {
+  const { markdown, html } = (body ?? {}) as { markdown?: unknown; html?: unknown };
+  if (markdown !== undefined && html !== undefined) {
+    throw new ApiError(400, 'invalid_request', 'markdown と html は同時に指定できません。どちらか一方を指定してください。');
   }
-  if (markdown.trim() === '') {
-    throw new ApiError(400, 'empty_markdown', 'Markdownが空です。');
+  const kind = html !== undefined ? 'html' : 'markdown';
+  const text = html !== undefined ? html : markdown;
+  if (typeof text !== 'string') {
+    throw new ApiError(400, 'invalid_request', 'リクエストは {"markdown": "<文字列>"} または {"html": "<文字列>"} の形式で指定してください。');
   }
-  if (Buffer.byteLength(markdown, 'utf8') > maxBytes) {
-    throw new ApiError(413, 'markdown_too_large', `Markdownが大きすぎます(上限 ${maxBytes} バイト)。`);
+  if (text.trim() === '') {
+    throw new ApiError(400, `empty_${kind}`, `${SOURCE_LABEL[kind]}が空です。`);
   }
-  return markdown;
+  if (Buffer.byteLength(text, 'utf8') > maxBytes) {
+    throw new ApiError(413, `${kind}_too_large`, `${SOURCE_LABEL[kind]}が大きすぎます(上限 ${maxBytes} バイト)。`);
+  }
+  return { kind, text };
 }
 
 export function createApp(deps: AppDependencies): Express {
@@ -65,8 +80,11 @@ export function createApp(deps: AppDependencies): Express {
   const jsonParser = express.json({ limit: deps.maxMarkdownBytes * 2 + 1024 });
 
   app.post('/api/pdf', jsonParser, async (req, res) => {
-    const markdown = parseMarkdown(req.body, deps.maxMarkdownBytes);
-    const pdf = await deps.renderer.render(buildDocumentHtml(markdown, deps.css));
+    const source = parseSource(req.body, deps.maxMarkdownBytes);
+    const pdf =
+      source.kind === 'markdown'
+        ? await deps.renderer.render(buildDocumentHtml(source.text, deps.css))
+        : await deps.renderer.render(prepareHtmlForPdf(source.text), { preferCssPageSize: true });
     res.status(200).type('application/pdf').setHeader('Cache-Control', 'no-store');
     res.send(pdf);
   });
@@ -96,7 +114,7 @@ export function createApp(deps: AppDependencies): Express {
     }
     const type = (err as { type?: unknown } | null)?.type;
     if (type === 'entity.too.large') {
-      sendError(res, 413, 'markdown_too_large', `リクエストが大きすぎます(Markdownの上限 ${deps.maxMarkdownBytes} バイト)。`);
+      sendError(res, 413, 'markdown_too_large', `リクエストが大きすぎます(Markdown・HTMLの上限 ${deps.maxMarkdownBytes} バイト)。`);
       return;
     }
     if (type === 'entity.parse.failed') {

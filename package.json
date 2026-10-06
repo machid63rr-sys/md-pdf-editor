@@ -20,6 +20,7 @@
   "dependencies": {
     "express": "^5.2.1",
     "mdast-util-to-string": "^4.0.0",
+    "parse5": "^8.0.1",
     "puppeteer-core": "^25.12.0",
     "rehype-stringify": "^10.0.1",
     "remark-breaks": "^4.0.0",

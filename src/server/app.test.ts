@@ -5,16 +5,18 @@ import { join } from 'node:path';
 import type { Server } from 'node:http';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createApp } from './app.js';
-import { PdfRenderError, type PdfRenderer } from './pdf.js';
+import { PdfRenderError, type PdfRenderer, type RenderOptions } from './pdf.js';
 
 // PDF生成そのものはtests/pdf.integration.test.tsで実Chromiumを使って検証する。
 // ここではHTTP層(検証・エラー応答・配信)だけを確認するため、呼び出し内容を記録する代役を使う
 class RecordingRenderer implements PdfRenderer {
   readonly htmls: string[] = [];
+  readonly options: (RenderOptions | undefined)[] = [];
   failWith: Error | undefined;
 
-  render(html: string): Promise<Buffer> {
+  render(html: string, options?: RenderOptions): Promise<Buffer> {
     this.htmls.push(html);
+    this.options.push(options);
     return this.failWith ? Promise.reject(this.failWith) : Promise.resolve(Buffer.from('%PDF-1.7 dummy'));
   }
 
@@ -67,6 +69,38 @@ describe('POST /api/pdf', () => {
     expect(renderer.htmls).toHaveLength(1);
     expect(renderer.htmls[0]).toContain('<h1>見出し</h1>');
     expect(renderer.htmls[0]).toContain('.document{}');
+  });
+
+  it('HTMLを渡すとPDFを返し、安全対策を加えたHTMLがレンダラへ渡る(Markdown用の共有CSSは加えない)', async () => {
+    renderer.htmls.length = 0;
+    renderer.options.length = 0;
+    const res = await postPdf(JSON.stringify({ html: '<!DOCTYPE html><html><head><title>t</title></head><body><h1 class="x">見出し</h1></body></html>' }));
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('application/pdf');
+    expect(renderer.htmls).toHaveLength(1);
+    expect(renderer.htmls[0]).toContain('<h1 class="x">見出し</h1>');
+    expect(renderer.htmls[0]).toContain('Content-Security-Policy');
+    expect(renderer.htmls[0]).not.toContain('.document{}');
+    // 利用者のHTMLが指定する用紙サイズ(@page)を尊重する
+    expect(renderer.options[0]).toEqual({ preferCssPageSize: true });
+  });
+
+  it('Markdownの場合は、用紙サイズの指定を尊重しない(従来どおりA4)', async () => {
+    renderer.options.length = 0;
+    await postPdf(JSON.stringify({ markdown: '# a' }));
+    expect(renderer.options[0]).toBeUndefined();
+  });
+
+  it.each([
+    ['htmlが文字列でない', JSON.stringify({ html: 1 }), 400, 'invalid_request'],
+    ['htmlが空白だけ', JSON.stringify({ html: ' \n ' }), 400, 'empty_html'],
+    ['markdownとhtmlの両方を指定', JSON.stringify({ markdown: '# a', html: '<p>a</p>' }), 400, 'invalid_request'],
+    ['htmlが上限を超える', JSON.stringify({ html: `<p>${'あ'.repeat(MAX_BYTES / 3 + 1)}</p>` }), 413, 'html_too_large'],
+  ])('%sなら%i', async (_label, body, status, code) => {
+    const res = await postPdf(body);
+    expect(res.status).toBe(status);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe(code);
   });
 
   it.each([

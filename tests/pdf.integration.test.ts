@@ -5,6 +5,7 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { prepareHtmlForPdf } from '../src/server/htmlDocument.js';
 import { buildDocumentHtml } from '../src/server/markdownToHtml.js';
 import { createPdfRenderer, type PdfRenderer } from '../src/server/pdf.js';
 import { selfCheck } from '../src/server/selfCheck.js';
@@ -119,6 +120,76 @@ describe('PDF生成(実Chromium)', () => {
     const broken = createPdfRenderer({ chromiumPath: '/nonexistent/chromium', timeoutMs: 5_000 });
     await expect(broken.render('<p>x</p>')).rejects.toThrowError('PDFの生成に失敗しました');
     await expect(broken.chromiumVersion()).rejects.toThrowError('Chromiumを起動できません');
+  });
+});
+
+describe('HTMLのPDF生成(実Chromium)', () => {
+  // サーバと同じく、安全対策を加えたHTMLを、用紙サイズの指定を尊重して描画する
+  const renderHtml = (html: string, name: string): Promise<string> =>
+    renderer.render(prepareHtmlForPdf(html), { preferCssPageSize: true }).then((pdf) => writePdf(name, pdf));
+
+  it('利用者のHTMLとCSS(日本語・色・表)が、そのままPDFになる(既定はA4)', async () => {
+    const html =
+      '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><title>案内</title><style>h1{color:#c00}td{border:1px solid #000}</style></head>' +
+      '<body><h1>お知らせ</h1><p>本日は<b>休業</b>です。</p><table><tr><td>項目</td><td>内容</td></tr></table></body></html>';
+    const path = await renderHtml(html, 'html-basic.pdf');
+
+    expect(readFileSync(path).subarray(0, 5).toString('latin1')).toBe('%PDF-');
+    expect(poppler('pdfinfo', path)).toMatch(/Page size:\s+595\.\d+ x 841\.\d+ pts \(A4\)/);
+    expect(poppler('pdffonts', path)).toContain('NotoSansCJKjp');
+    const text = poppler('pdftotext', path, '-');
+    expect(text).toContain('お知らせ');
+    expect(text).toContain('休業');
+    expect(text).toContain('項目');
+    // Markdown用の共有CSS(.document)は、利用者のHTMLには適用されない
+    expect(text).toMatch(/1\s*\/\s*1/);
+  });
+
+  it('CSSの @page で用紙サイズを指定すると、その大きさのPDFになる', async () => {
+    const html = '<!DOCTYPE html><html><head><style>@page { size: A5 landscape; }</style></head><body><p>横向きのA5</p></body></html>';
+    const info = poppler('pdfinfo', await renderHtml(html, 'html-a5.pdf'));
+    // A5の横向き(210mm x 148mm)
+    expect(info).toMatch(/Page size:\s+59\d(\.\d+)? x 4[12]\d(\.\d+)? pts \(A5\)/);
+  });
+
+  it('data URIの画像はPDFに表示される', async () => {
+    const png =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    const path = await renderHtml(`<!DOCTYPE html><body><p>画像</p><img src="data:image/png;base64,${png}" width="80" height="80"></body>`, 'html-img.pdf');
+    expect(poppler('pdfimages', '-list', path)).toMatch(/\bimage\b/);
+  });
+
+  it('外部リソースへは通信しない(画像・CSS・フォント・メタリフレッシュの参照先がローカルのサーバでも、アクセスが発生しない)', async () => {
+    const requested: string[] = [];
+    const probe: Server = createServer((req, res) => {
+      requested.push(req.url ?? '');
+      res.end();
+    });
+    await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', resolve));
+    const { port } = probe.address() as AddressInfo;
+    const origin = `http://127.0.0.1:${port}`;
+    try {
+      const html =
+        `<!DOCTYPE html><html><head><meta http-equiv="refresh" content="0;url=${origin}/refresh"><link rel="stylesheet" href="${origin}/a.css">` +
+        `<style>@import url(${origin}/b.css); @font-face{font-family:x;src:url(${origin}/f.woff)} p{background:url(${origin}/bg.png);font-family:x}</style></head>` +
+        `<body><img src="${origin}/img.png"><iframe src="${origin}/frame"></iframe><p>本文は残る</p></body></html>`;
+      const path = await renderHtml(html, 'html-external.pdf');
+
+      expect(requested).toEqual([]);
+      // 遮断された移動先のエラーページではなく、利用者の文書がPDFになる
+      expect(poppler('pdftotext', path, '-')).toContain('本文は残る');
+    } finally {
+      await new Promise<void>((resolve, reject) => probe.close((error) => (error ? reject(error) : resolve())));
+    }
+  });
+
+  it('スクリプトは実行されない(イベント属性も含む)', async () => {
+    const html =
+      '<!DOCTYPE html><body><p id="t">前</p><script>document.getElementById("t").textContent="実行された";</script>' +
+      '<img src="x" onerror="document.getElementById(\'t\').textContent=\'実行された\'"></body>';
+    const text = poppler('pdftotext', await renderHtml(html, 'html-script.pdf'), '-');
+    expect(text).toContain('前');
+    expect(text).not.toContain('実行された');
   });
 });
 

@@ -3,8 +3,13 @@ import { SerialQueue } from './serialQueue.js';
 
 export class PdfRenderError extends Error {}
 
+export interface RenderOptions {
+  // 文書のCSS(@page { size: … })が指定する用紙サイズを、既定のA4より優先する(利用者のHTML用)
+  readonly preferCssPageSize?: boolean;
+}
+
 export interface PdfRenderer {
-  render(html: string): Promise<Buffer>;
+  render(html: string, options?: RenderOptions): Promise<Buffer>;
   chromiumVersion(): Promise<string>;
 }
 
@@ -46,7 +51,7 @@ export function createPdfRenderer(options: PdfRendererOptions): PdfRenderer {
     });
 
   return {
-    render(html: string): Promise<Buffer> {
+    render(html: string, renderOptions?: RenderOptions): Promise<Buffer> {
       return queue.run(async () => {
         let browser: Browser | undefined;
         try {
@@ -68,6 +73,7 @@ export function createPdfRenderer(options: PdfRendererOptions): PdfRenderer {
             format: 'A4',
             margin: { top: '20mm', bottom: '25mm', left: '20mm', right: '20mm' },
             printBackground: true,
+            preferCSSPageSize: renderOptions?.preferCssPageSize ?? false,
             displayHeaderFooter: true,
             headerTemplate: '<span></span>',
             footerTemplate: FOOTER_TEMPLATE,

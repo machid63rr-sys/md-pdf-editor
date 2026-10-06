@@ -1,10 +1,10 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import type { Server } from 'node:http';
+import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import puppeteer, { type Browser, type Page } from 'puppeteer-core';
+import puppeteer, { type Browser, type ElementHandle, type Frame, type Page } from 'puppeteer-core';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createApp } from '../src/server/app.js';
 import { createPdfRenderer } from '../src/server/pdf.js';
@@ -559,6 +559,350 @@ describe('画面操作(実ブラウザ)', () => {
         () => [...document.querySelectorAll('button')].find((b) => b.textContent?.includes('ダウンロードで保存'))?.disabled,
       );
       expect(disabled).toBe(true);
+    });
+  });
+
+  describe('HTML・CSSの編集(実ブラウザ)', () => {
+    // 整っていない書き方(省略タグ・引用符の違い・実体参照・コメント・表のtbody省略)を含む、取り込んだままの形が保たれるべきHTML
+    const HTML_SAMPLE = [
+      '<!DOCTYPE html>',
+      '<html lang="ja">',
+      '<head>',
+      '  <meta charset="utf-8">',
+      '  <title>案内</title>',
+      '  <style>h1 { color: #c00; } p.lead { font-weight: bold }</style>',
+      '</head>',
+      '<body class=main>',
+      '  <h1 id=top>お知らせ &amp; ご案内</h1>',
+      "  <p class='lead'>本日は休業です。&copy; 2026</p>",
+      '  <!-- メモ -->',
+      '  <p class="note">補足です。</p>',
+      '  <ul>',
+      '    <li>項目1',
+      '    <li>項目2',
+      '  </ul>',
+      '  <table><tr><td>A</td><td>B</td></tr></table>',
+      '  <pre>  整形済み\n    テキスト</pre>',
+      '</body>',
+      '</html>',
+      '',
+    ].join('\n');
+
+    const selectPasteKind = (label: string): Promise<void> =>
+      page.evaluate((text) => {
+        const input = [...document.querySelectorAll('.paste-kind label')].find((l) => l.textContent?.includes(text))?.querySelector('input');
+        (input as HTMLInputElement).click();
+      }, label);
+
+    // 編集できるプレビュー(iframe)が表示され、編集の準備ができるまで待つ
+    const previewFrame = async (): Promise<Frame> => {
+      await page.waitForFunction(
+        () => (document.querySelector('iframe.html-preview-frame') as HTMLIFrameElement | null)?.contentDocument?.designMode === 'on',
+      );
+      const handle = await page.$('iframe.html-preview-frame');
+      const frame = await handle?.contentFrame();
+      if (frame === null || frame === undefined) {
+        throw new Error('プレビューのiframeが見つかりません');
+      }
+      return frame;
+    };
+
+    async function openHtml(html: string): Promise<Frame> {
+      await setPasted(html);
+      await selectPasteKind('HTML');
+      await clickButton('貼り付けた内容を読み込む');
+      return previewFrame();
+    }
+
+    const htmlSource = async (): Promise<string> => {
+      await clickButton('HTML');
+      await page.waitForSelector('textarea[aria-label="HTML"]');
+      return page.$eval('textarea[aria-label="HTML"]', (element) => (element as HTMLTextAreaElement).value);
+    };
+
+    // プレビュー内で、指定した要素の末尾にカーソルを置く(フォーカスはiframeへ移す)
+    const caretAtEnd = async (frame: Frame, selector: string): Promise<void> => {
+      await (await page.$('iframe.html-preview-frame'))?.click();
+      await frame.evaluate((sel) => {
+        const element = document.querySelector(sel) as HTMLElement;
+        const range = document.createRange();
+        range.selectNodeContents(element);
+        range.collapse(false);
+        const selection = window.getSelection() as Selection;
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }, selector);
+    };
+
+    const WAIT_FOR_DEBOUNCE_MS = 400;
+    const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, WAIT_FOR_DEBOUNCE_MS));
+
+    it('HTMLを貼り付けると、プレビューに表示される(CSSも適用され、エラーにならない)', async () => {
+      const frame = await openHtml(HTML_SAMPLE);
+      const text = await frame.$eval('body', (element) => (element as HTMLElement).innerText);
+      expect(text).toContain('お知らせ & ご案内');
+      expect(text).toContain('項目2');
+      expect(await frame.$eval('h1', (element) => getComputedStyle(element).color)).toBe('rgb(204, 0, 0)');
+      expect(await page.$('[role="alert"]')).toBeNull();
+      await shot('10-html-preview');
+      expect(consoleErrors).toEqual([]);
+    });
+
+    it('編集していなければ、実ブラウザが解釈し直した文書から差分を取っても、HTMLは1文字も変わらない', async () => {
+      const frame = await openHtml(HTML_SAMPLE);
+      // 編集イベントを人為的に起こし、実Chromiumが解釈した文書とソースを比較させる(差分が無ければ何も書き換わらない)
+      await frame.evaluate(() => document.dispatchEvent(new Event('input')));
+      await settle();
+      expect(await htmlSource()).toBe(HTML_SAMPLE);
+      expect(await page.$('[role="alert"]')).toBeNull();
+    });
+
+    it('プレビューで文字を編集すると、その箇所だけがHTMLへ反映され、他の部分(引用符・省略タグ・実体参照・コメント)はそのまま', async () => {
+      const frame = await openHtml(HTML_SAMPLE);
+      await caretAtEnd(frame, 'p.lead');
+      await page.keyboard.type('ありがとう');
+      await settle();
+
+      const source = await htmlSource();
+      expect(source).toBe(HTML_SAMPLE.replace('本日は休業です。&copy; 2026', '本日は休業です。© 2026ありがとう'));
+      expect(source).toContain('<h1 id=top>お知らせ &amp; ご案内</h1>');
+      expect(source).toContain('<li>項目1\n    <li>項目2\n  </ul>');
+      expect(source).toContain('<body class=main>');
+      expect(source).toContain('<!-- メモ -->');
+      await shot('11-html-edited');
+      expect(consoleErrors).toEqual([]);
+    });
+
+    it('「太字」ボタンで、選択した範囲がタグで囲まれ、その段落の中だけが書き換わる', async () => {
+      const frame = await openHtml(HTML_SAMPLE);
+      await (await page.$('iframe.html-preview-frame'))?.click();
+      await frame.evaluate(() => {
+        const range = document.createRange();
+        range.selectNodeContents(document.querySelector('p.note') as HTMLElement);
+        const selection = window.getSelection() as Selection;
+        selection.removeAllRanges();
+        selection.addRange(range);
+      });
+      await clickButton('太字');
+      await settle();
+
+      const source = await htmlSource();
+      expect(source).toBe(HTML_SAMPLE.replace('<p class="note">補足です。</p>', '<p class="note"><b>補足です。</b></p>'));
+    });
+
+    it('Enterで新しい段落を作ると、その分だけが追加され、他の部分は変わらない', async () => {
+      const frame = await openHtml(HTML_SAMPLE);
+      await caretAtEnd(frame, 'p.lead');
+      await page.keyboard.press('Enter');
+      await page.keyboard.type('新しい段落');
+      await settle();
+
+      const source = await htmlSource();
+      expect(source).toContain('新しい段落</p>');
+      expect(source).toContain('<h1 id=top>お知らせ &amp; ご案内</h1>');
+      expect(source).toContain('<li>項目1\n    <li>項目2\n  </ul>');
+      expect(source).toContain('<table><tr><td>A</td><td>B</td></tr></table>');
+      expect(source.startsWith('<!DOCTYPE html>\n<html lang="ja">\n<head>')).toBe(true);
+      expect(source.endsWith('</body>\n</html>\n')).toBe(true);
+    });
+
+    it('HTMLタブで直接編集すると、隣のプレビューに反映され、プレビューへ戻っても編集内容が表示される', async () => {
+      await openHtml(HTML_SAMPLE);
+      await clickButton('HTML');
+      await page.waitForSelector('textarea[aria-label="HTML"]');
+      await page.$eval('textarea[aria-label="HTML"]', (element, value) => {
+        const area = element as HTMLTextAreaElement;
+        const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+        setter?.call(area, value);
+        area.dispatchEvent(new Event('input', { bubbles: true }));
+      }, HTML_SAMPLE.replace('項目1', '直接編集した項目'));
+
+      const side = (await (await page.$('iframe.html-preview-frame'))?.contentFrame()) as Frame;
+      await side.waitForFunction(() => document.body.innerText.includes('直接編集した項目'));
+      await shot('12-html-source-tab');
+
+      await clickButton('プレビュー');
+      const frame = await previewFrame();
+      await frame.waitForFunction(() => document.body.innerText.includes('直接編集した項目'));
+    });
+
+    it('スクリプトは実行されず、外部へも通信しない(プレビュー)', async () => {
+      const requested: string[] = [];
+      const probe: Server = createServer((req, res) => {
+        requested.push(req.url ?? '');
+        res.end();
+      });
+      await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', resolve));
+      const { port } = probe.address() as AddressInfo;
+      try {
+        const html =
+          '<!DOCTYPE html><body><p id="t">前</p><script>document.getElementById("t").textContent="実行された";</script>' +
+          `<img src="http://127.0.0.1:${port}/img.png" onerror="document.getElementById('t').textContent='実行された'">` +
+          `<style>p { background: url(http://127.0.0.1:${port}/bg.png) }</style></body>`;
+        const frame = await openHtml(html);
+        await settle();
+
+        expect(await frame.$eval('#t', (element) => element.textContent)).toBe('前');
+        expect(requested).toEqual([]);
+        // 出力前の警告で知らせる
+        const warnings = await page.$eval('.warning-list', (element) => (element as HTMLElement).innerText);
+        expect(warnings).toContain('スクリプト');
+        expect(warnings).toContain('外部の画像');
+      } finally {
+        await new Promise<void>((resolve, reject) => probe.close((error) => (error ? reject(error) : resolve())));
+      }
+    });
+
+    it('リンクをクリックしても、プレビューは別のページへ移らない', async () => {
+      await openHtml('<!DOCTYPE html><body><p><a href="https://example.com/">リンク</a></p></body>');
+      await clickButton('HTML');
+      const side = (await (await page.$('iframe.html-preview-frame'))?.contentFrame()) as Frame;
+      await side.waitForSelector('a');
+      await side.click('a');
+      await settle();
+      expect(side.url()).toBe('about:srcdoc');
+      expect(await side.$eval('p', (element) => element.textContent)).toBe('リンク');
+    });
+
+    describe('CSSファイルを一緒に取り込む', () => {
+      let dir: string;
+      const files = (): { html: string; css: string; other: string } => ({
+        html: join(dir, 'index.html'),
+        css: join(dir, 'style.css'),
+        other: join(dir, 'other.html'),
+      });
+      const PAGE = '<!DOCTYPE html>\n<html>\n<head>\n<title>t</title>\n<link rel="stylesheet" href="css/style.css">\n</head>\n<body>\n<h1>見出し</h1>\n<p>本文</p>\n</body>\n</html>\n';
+
+      beforeEach(() => {
+        dir = mkdtempSync(join(tmpdir(), 'md-pdf-editor-html-'));
+        writeFileSync(files().html, PAGE);
+        writeFileSync(files().css, 'h1 { color: rgb(204, 0, 0); }');
+        writeFileSync(files().other, '<p>別</p>');
+      });
+
+      const upload = async (...paths: string[]): Promise<void> => {
+        await page.goto(baseUrl);
+        await page.waitForSelector('input[type=file]', { hidden: true });
+        const input = (await page.$('input[type=file]')) as ElementHandle<HTMLInputElement>;
+        await input.uploadFile(...paths);
+      };
+
+      it('HTMLの<link>と同じ名前のCSSが適用され、CSSタブで編集でき、隣のプレビューに反映される', async () => {
+        await upload(files().css, files().html);
+        const frame = await previewFrame();
+        expect(await frame.$eval('h1', (element) => getComputedStyle(element).color)).toBe('rgb(204, 0, 0)');
+        // 参照されているCSSなので、「参照されていない」旨の警告は出ない
+        expect(await page.$('.warning-list')).toBeNull();
+        expect(await page.$$eval('.tab', (tabs) => tabs.map((tab) => tab.textContent))).toEqual(['プレビュー(直接編集)', 'HTML', 'CSS: style.css']);
+
+        await clickButton('CSS: style.css');
+        await page.waitForSelector('textarea[aria-label="CSS: style.css"]');
+        await page.$eval('textarea[aria-label="CSS: style.css"]', (element) => {
+          const area = element as HTMLTextAreaElement;
+          const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+          setter?.call(area, 'h1 { color: rgb(0, 0, 255); }');
+          area.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        const side = (await (await page.$('iframe.html-preview-frame'))?.contentFrame()) as Frame;
+        await side.waitForFunction(() => getComputedStyle(document.querySelector('h1') as Element).color === 'rgb(0, 0, 255)');
+        await shot('13-css-tab');
+
+        // プレビューへ戻っても、編集したCSSが適用されている。HTMLは、CSSを埋め込まれず、取り込んだままである
+        await clickButton('プレビュー');
+        const edited = await previewFrame();
+        expect(await edited.$eval('h1', (element) => getComputedStyle(element).color)).toBe('rgb(0, 0, 255)');
+        expect(await htmlSource()).toBe(PAGE);
+      });
+
+      it('HTML・CSS・PDFを、HTMLの参照名(style.css)のまま、選んだフォルダへ出力できる', async () => {
+        await upload(files().html, files().css);
+        const frame = await previewFrame();
+        await caretAtEnd(frame, 'p');
+        await page.keyboard.type('(追記)');
+        await settle();
+
+        const labels = await page.$$eval('.file-select label', (items) => items.map((item) => item.textContent?.trim()));
+        expect(labels).toEqual(['HTML (.html)', 'CSS (style.css)', 'PDF (.pdf)']);
+        await clickButton('出力先フォルダを選択');
+        await page.waitForFunction(
+          () => !([...document.querySelectorAll('button')].find((b) => b.textContent?.includes('選んだフォルダへHTMLとCSSとPDFを出力'))?.disabled ?? true),
+        );
+        await clickButton('選んだフォルダへHTMLとCSSとPDFを出力');
+        await page.waitForSelector('.notice-success', { timeout: 60_000 });
+
+        const saved = await page.evaluate(async () => {
+          const dir = await navigator.storage.getDirectory();
+          const names: string[] = [];
+          for await (const name of (dir as unknown as { keys(): AsyncIterable<string> }).keys()) {
+            names.push(name);
+          }
+          const read = async (name: string) => (await (await dir.getFileHandle(name)).getFile()).text();
+          return {
+            names: names.sort(),
+            html: await read('index.html'),
+            css: await read('style.css'),
+            pdfHeader: (await read('index.pdf')).slice(0, 5),
+          };
+        });
+        expect(saved.names).toEqual(['index.html', 'index.pdf', 'style.css']);
+        expect(saved.html).toBe(PAGE.replace('<p>本文</p>', '<p>本文(追記)</p>'));
+        expect(saved.css).toBe('h1 { color: rgb(204, 0, 0); }');
+        expect(saved.pdfHeader).toBe('%PDF-');
+        await shot('14-html-output');
+        expect(consoleErrors).toEqual([]);
+      });
+
+      it('HTMLだけを選んで保存すると、ファイル名の指定は.htmlに使われ、CSSとPDFは保存されない', async () => {
+        await upload(files().html, files().css);
+        await previewFrame();
+        await page.evaluate(() => {
+          for (const text of ['CSS (style.css)', 'PDF (.pdf)']) {
+            const input = [...document.querySelectorAll('.file-select label')].find((l) => l.textContent?.includes(text))?.querySelector('input');
+            (input as HTMLInputElement).click();
+          }
+        });
+        await page.$eval('#base-name', (element) => {
+          const input = element as HTMLInputElement;
+          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+          setter?.call(input, '案内');
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        await clickButton('出力先フォルダを選択');
+        await page.waitForFunction(
+          () => !([...document.querySelectorAll('button')].find((b) => b.textContent?.includes('選んだフォルダへHTMLを出力'))?.disabled ?? true),
+        );
+        await clickButton('選んだフォルダへHTMLを出力');
+        await page.waitForSelector('.notice-success');
+        const names = await page.evaluate(async () => {
+          const dir = await navigator.storage.getDirectory();
+          const found: string[] = [];
+          for await (const name of (dir as unknown as { keys(): AsyncIterable<string> }).keys()) {
+            found.push(name);
+          }
+          return found;
+        });
+        expect(names).toEqual(['案内.html']);
+      });
+
+      it('CSSだけ・HTMLが2つ・Markdownと一緒のCSSは、取り込まず理由を表示する', async () => {
+        await upload(files().css);
+        await page.waitForSelector('[role="alert"]');
+        expect(await page.$eval('[role="alert"]', (element) => (element as HTMLElement).innerText)).toContain('CSSファイルだけは取り込めません');
+
+        await upload(files().html, files().other);
+        await page.waitForSelector('[role="alert"]');
+        expect(await page.$eval('[role="alert"]', (element) => (element as HTMLElement).innerText)).toContain('1つずつ取り込んでください');
+      });
+
+      it('どの<link>にも参照されていないCSSは、<head>の末尾に追加して適用し、その旨を知らせる', async () => {
+        writeFileSync(files().html, '<!DOCTYPE html>\n<html>\n<head>\n<title>t</title>\n</head>\n<body>\n<h1>見出し</h1>\n</body>\n</html>\n');
+        await upload(files().html, files().css);
+        const frame = await previewFrame();
+        expect(await frame.$eval('h1', (element) => getComputedStyle(element).color)).toBe('rgb(204, 0, 0)');
+        const warnings = await page.$eval('.warning-list', (element) => (element as HTMLElement).innerText);
+        expect(warnings).toContain('style.css');
+        expect(warnings).toContain('追加して適用');
+      });
     });
   });
 

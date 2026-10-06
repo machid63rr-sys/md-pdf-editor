@@ -2,14 +2,26 @@ import React, { useMemo, useState } from 'react';
 import { checkDirectoryPickerSupport } from './browserSupport';
 import { downloadBlob } from './download';
 import { validateBaseName } from './filename';
-import { folderOutputLabel, hasSelection, NO_SELECTION_HINT, selectedExtensions, type FileSelection } from './outputMode';
-import { requestPdf } from './pdfClient';
+import {
+  chosenFiles,
+  fileNameOf,
+  folderOutputLabel,
+  NO_SELECTION_HINT,
+  selectedExtensions,
+  usesBaseName,
+  type OutputFile,
+} from './outputMode';
 import { ensureReadWrite, writeOutputs, type OutputReport } from './writeOutputs';
 
 interface OutputPanelProps {
-  markdown: string;
+  // 保存できるファイルの一覧(文書の種類によって異なる)
+  files: readonly OutputFile[];
   // 出力ファイル名(拡張子なし)の初期値
   defaultBaseName: string;
+  // 現在の内容からPDFを生成する。失敗した場合は、利用者に見せられるメッセージつきで例外にする
+  generatePdf: () => Promise<Blob>;
+  // 文書が空の場合 true(出力できない)
+  empty: boolean;
 }
 
 interface Status {
@@ -17,10 +29,17 @@ interface Status {
   readonly text: string;
 }
 
+// 保存するファイルの、名前と内容。PDFの内容はBlob、それ以外は文字列と種類(MIME)
+interface Entry {
+  readonly name: string;
+  readonly data: string | Blob;
+  readonly mimeType: string;
+}
+
 const messageOf = (cause: unknown): string => (cause instanceof Error ? cause.message : String(cause));
 
-// 2つ目のダウンロードを、1つ目の開始の直後に発行すると、ブラウザに無視されることがあるため少し間を置く
-const SECOND_DOWNLOAD_DELAY_MS = 400;
+// 2つ目以降のダウンロードを、1つ目の開始の直後に発行すると、ブラウザに無視されることがあるため少し間を置く
+const NEXT_DOWNLOAD_DELAY_MS = 400;
 const delay = (ms: number): Promise<void> => new Promise((resolve) => window.setTimeout(resolve, ms));
 
 function describeReport(report: OutputReport, folderName: string): Status {
@@ -35,18 +54,22 @@ function describeReport(report: OutputReport, folderName: string): Status {
   return { kind: 'error', text: `一部またはすべての出力に失敗しました。${written} 失敗: ${failures}` };
 }
 
-/** 保存するファイルの選択、出力先フォルダの選択、MD・PDFの出力 */
-const OutputPanel: React.FC<OutputPanelProps> = ({ markdown, defaultBaseName }) => {
+/** 保存するファイルの選択、出力先フォルダの選択、ファイルの出力 */
+const OutputPanel: React.FC<OutputPanelProps> = ({ files, defaultBaseName, generatePdf, empty }) => {
   const directorySupport = useMemo(() => checkDirectoryPickerSupport(window), []);
-  const [selection, setSelection] = useState<FileSelection>({ markdown: true, pdf: true });
+  const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set(files.map((file) => file.id)));
   const [baseName, setBaseName] = useState(defaultBaseName);
   const [directory, setDirectory] = useState<FileSystemDirectoryHandle | null>(null);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<Status | null>(null);
 
-  const anySelected = hasSelection(selection);
+  const chosen = chosenFiles(files, selected);
+  const anySelected = chosen.length > 0;
+  const needsPdf = chosen.some((file) => file.content.type === 'pdf');
+  const needsName = usesBaseName(chosen);
   const nameCheck = validateBaseName(baseName);
-  const isEmpty = markdown.trim() === '';
+  const nameUsable = !needsName || nameCheck.ok;
+  const fixedNames = chosen.flatMap((file) => (file.fixedName === undefined ? [] : [file.fixedName]));
 
   const chooseDirectory = async (): Promise<void> => {
     try {
@@ -65,22 +88,31 @@ const OutputPanel: React.FC<OutputPanelProps> = ({ markdown, defaultBaseName }) 
     }
   };
 
-  // 選んだフォルダへ、チェックされたファイル(MD・PDFの片方または両方)を書き込む
+  // 選ばれたファイルの内容をそろえる。PDFは、ここで生成する
+  const collectEntries = async (): Promise<Entry[]> => {
+    const pdf = needsPdf ? await generatePdf() : null;
+    return chosen.map((file) => {
+      const name = fileNameOf(file, baseName);
+      if (file.content.type === 'pdf') {
+        return { name, data: pdf as Blob, mimeType: 'application/pdf' };
+      }
+      return { name, data: file.content.text, mimeType: file.content.mimeType };
+    });
+  };
+
+  // 選んだフォルダへ、チェックされたファイルを書き込む
   const outputToFolder = async (): Promise<void> => {
-    if (directory === null || !nameCheck.ok) {
+    if (directory === null || !nameUsable) {
       return;
     }
     setBusy(true);
-    setStatus(selection.pdf ? { kind: 'info', text: 'PDFを生成しています…' } : null);
+    setStatus(needsPdf ? { kind: 'info', text: 'PDFを生成しています…' } : null);
     try {
       // 書き込み権限の再確認はクリック直後(ユーザー操作の有効期間内)に行う。PDF生成には数秒かかるため、その前に済ませる
       await ensureReadWrite(directory);
-      const pdf = selection.pdf ? await requestPdf(markdown) : null;
       const report = await writeOutputs({
         directory,
-        baseName,
-        markdown: selection.markdown ? markdown : null,
-        pdf,
+        files: await collectEntries(),
         confirmOverwrite: (names) => window.confirm(`次のファイルは既に存在します。上書きしますか?\n\n${names.join('\n')}`),
       });
       setStatus(describeReport(report, directory.name));
@@ -93,25 +125,21 @@ const OutputPanel: React.FC<OutputPanelProps> = ({ markdown, defaultBaseName }) 
 
   // フォルダを選べない場合(システムフォルダの制限・非対応ブラウザなど)のための保存方法。保存先はブラウザの設定に従う
   const download = async (): Promise<void> => {
-    if (!nameCheck.ok) {
+    if (!nameUsable) {
       return;
     }
     setBusy(true);
-    setStatus({ kind: 'info', text: selection.pdf ? 'PDFを生成しています…' : 'ダウンロードしています…' });
+    setStatus({ kind: 'info', text: needsPdf ? 'PDFを生成しています…' : 'ダウンロードしています…' });
     try {
-      const pdf = selection.pdf ? await requestPdf(markdown) : null;
-      const names: string[] = [];
-      if (selection.markdown) {
-        downloadBlob(new Blob([markdown], { type: 'text/markdown;charset=utf-8' }), `${baseName}.md`);
-        names.push(`${baseName}.md`);
-      }
-      if (pdf !== null) {
-        if (names.length > 0) {
-          await delay(SECOND_DOWNLOAD_DELAY_MS);
+      const entries = await collectEntries();
+      for (const [index, entry] of entries.entries()) {
+        if (index > 0) {
+          await delay(NEXT_DOWNLOAD_DELAY_MS);
         }
-        downloadBlob(pdf, `${baseName}.pdf`);
-        names.push(`${baseName}.pdf`);
+        const blob = entry.data instanceof Blob ? entry.data : new Blob([entry.data], { type: `${entry.mimeType};charset=utf-8` });
+        downloadBlob(blob, entry.name);
       }
+      const names = entries.map((entry) => entry.name);
       setStatus({
         kind: 'success',
         text: `ダウンロードを開始しました: ${names.join('、')} (保存先はブラウザのダウンロード設定に従います${names.length > 1 ? '。複数ファイルのダウンロードを確認された場合は、許可してください' : ''})`,
@@ -135,7 +163,7 @@ const OutputPanel: React.FC<OutputPanelProps> = ({ markdown, defaultBaseName }) 
     setBusy(true);
     setStatus({ kind: 'info', text: 'PDFを生成しています…' });
     try {
-      const url = URL.createObjectURL(await requestPdf(markdown));
+      const url = URL.createObjectURL(await generatePdf());
       tab.location.href = url;
       window.setTimeout(() => URL.revokeObjectURL(url), 5 * 60 * 1000);
       setStatus(null);
@@ -147,8 +175,16 @@ const OutputPanel: React.FC<OutputPanelProps> = ({ markdown, defaultBaseName }) 
     }
   };
 
-  const toggle = (key: keyof FileSelection) => (event: React.ChangeEvent<HTMLInputElement>) =>
-    setSelection((current) => ({ ...current, [key]: event.target.checked }));
+  const toggle = (id: string) => (event: React.ChangeEvent<HTMLInputElement>) =>
+    setSelected((current) => {
+      const next = new Set(current);
+      if (event.target.checked) {
+        next.add(id);
+      } else {
+        next.delete(id);
+      }
+      return next;
+    });
 
   return (
     <section className="output-panel" aria-label="出力">
@@ -156,12 +192,11 @@ const OutputPanel: React.FC<OutputPanelProps> = ({ markdown, defaultBaseName }) 
 
       <fieldset className="field file-select">
         <legend>保存するファイル</legend>
-        <label>
-          <input type="checkbox" checked={selection.markdown} onChange={toggle('markdown')} disabled={busy} /> Markdown (.md)
-        </label>
-        <label>
-          <input type="checkbox" checked={selection.pdf} onChange={toggle('pdf')} disabled={busy} /> PDF (.pdf)
-        </label>
+        {files.map((file) => (
+          <label key={file.id}>
+            <input type="checkbox" checked={selected.has(file.id)} onChange={toggle(file.id)} disabled={busy} /> {file.label}
+          </label>
+        ))}
       </fieldset>
 
       <div className="field">
@@ -171,13 +206,18 @@ const OutputPanel: React.FC<OutputPanelProps> = ({ markdown, defaultBaseName }) 
           className="text-input"
           value={baseName}
           onChange={(event) => setBaseName(event.target.value)}
-          disabled={!anySelected || busy}
-          aria-invalid={anySelected && !nameCheck.ok}
+          disabled={!needsName || busy}
+          aria-invalid={needsName && !nameCheck.ok}
           spellCheck={false}
         />
-        <span className="field-suffix">{selectedExtensions(selection)}</span>
-        {anySelected && !nameCheck.ok && <p className="field-error">{nameCheck.message}</p>}
+        <span className="field-suffix">{selectedExtensions(chosen)}</span>
+        {needsName && !nameCheck.ok && <p className="field-error">{nameCheck.message}</p>}
         {!anySelected && <p className="field-hint">{NO_SELECTION_HINT}</p>}
+        {fixedNames.length > 0 && (
+          <p className="field-hint">
+            CSSファイルは、HTMLから参照されている名前(例: {fixedNames[0]})のまま保存します。ファイル名の指定は、CSS以外のファイルに使います。
+          </p>
+        )}
       </div>
 
       <div className="field">
@@ -205,20 +245,20 @@ const OutputPanel: React.FC<OutputPanelProps> = ({ markdown, defaultBaseName }) 
         <button
           type="button"
           className="button button-primary"
-          disabled={!anySelected || !directorySupport.supported || directory === null || !nameCheck.ok || isEmpty || busy}
+          disabled={!anySelected || !directorySupport.supported || directory === null || !nameUsable || empty || busy}
           onClick={() => void outputToFolder()}
         >
-          {folderOutputLabel(selection)}
+          {anySelected ? folderOutputLabel(chosen) : '選んだフォルダへ出力'}
         </button>
         <button
           type="button"
           className="button"
-          disabled={!anySelected || !nameCheck.ok || isEmpty || busy}
+          disabled={!anySelected || !nameUsable || empty || busy}
           onClick={() => void download()}
         >
           ダウンロードで保存
         </button>
-        <button type="button" className="button" disabled={isEmpty || busy} onClick={() => void previewPdf()}>
+        <button type="button" className="button" disabled={empty || busy} onClick={() => void previewPdf()}>
           PDFを生成して確認(新しいタブ)
         </button>
       </div>

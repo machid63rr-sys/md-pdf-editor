@@ -51,6 +51,12 @@ describe('defaultBaseName', () => {
     expect(defaultBaseName('a.b.md')).toBe('a.b');
   });
 
+  it('HTMLの拡張子(.html/.htm)も除く', () => {
+    expect(defaultBaseName('index.html')).toBe('index');
+    expect(defaultBaseName('案内.HTM')).toBe('案内');
+    expect(defaultBaseName('a.b.html')).toBe('a.b');
+  });
+
   it('貼り付け(ファイル名なし)や、拡張子を除くと空になる名前はdocument', () => {
     expect(defaultBaseName(null)).toBe('document');
     expect(defaultBaseName('.md')).toBe('document');

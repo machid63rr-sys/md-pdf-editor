@@ -1,5 +1,5 @@
 /*
- * 選択された出力先フォルダへ、選ばれたファイル(MD・PDFの片方または両方)を書き込む。
+ * 選択された出力先フォルダへ、選ばれたファイル(MD・HTML・CSS・PDFなど、1つ以上)を書き込む。
  * File System Access API の型そのものではなく、必要な操作だけを表すインターフェースに依存する
  * (実物の FileSystemDirectoryHandle はそのまま渡せる。テストでは、メモリ上の実装を渡す)。
  */
@@ -24,13 +24,16 @@ export interface PermissionLike {
   requestPermission?(descriptor: { mode: 'readwrite' }): Promise<PermissionState>;
 }
 
+export interface OutputEntry {
+  // ファイル名(拡張子つき。検証済みであること)
+  readonly name: string;
+  readonly data: string | Blob;
+}
+
 export interface OutputRequest {
   readonly directory: DirectoryLike;
-  // 拡張子なしのファイル名(検証済みであること)
-  readonly baseName: string;
-  // 書き込むファイルの内容。nullは「そのファイルは保存しない」(存在確認・上書き確認の対象にもしない)
-  readonly markdown: string | null;
-  readonly pdf: Blob | null;
+  // 書き込むファイル。ここに無いファイルは、存在確認・上書き確認の対象にもしない
+  readonly files: readonly OutputEntry[];
   // 既存のファイルがある場合に、上書きしてよいかを尋ねる。falseなら何も書かない
   readonly confirmOverwrite: (existingNames: readonly string[]) => boolean | Promise<boolean>;
 }
@@ -91,16 +94,8 @@ async function writeFile(directory: DirectoryLike, name: string, data: string | 
 }
 
 export async function writeOutputs(request: OutputRequest): Promise<OutputReport> {
-  const targets: (readonly [string, string | Blob])[] = [];
-  if (request.markdown !== null) {
-    targets.push([`${request.baseName}.md`, request.markdown]);
-  }
-  if (request.pdf !== null) {
-    targets.push([`${request.baseName}.pdf`, request.pdf]);
-  }
-
   const existing: string[] = [];
-  for (const [name] of targets) {
+  for (const { name } of request.files) {
     if (await exists(request.directory, name)) {
       existing.push(name);
     }
@@ -109,10 +104,10 @@ export async function writeOutputs(request: OutputRequest): Promise<OutputReport
     return { cancelled: true, written: [], failed: [] };
   }
 
-  // 2つ保存する場合、片方が失敗してももう片方は書き、成否をファイルごとに報告する
+  // 複数保存する場合、1つが失敗しても残りは書き、成否をファイルごとに報告する
   const written: string[] = [];
   const failed: OutputFailure[] = [];
-  for (const [name, data] of targets) {
+  for (const { name, data } of request.files) {
     try {
       await writeFile(request.directory, name, data, existing.includes(name));
       written.push(name);

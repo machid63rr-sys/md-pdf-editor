@@ -66,7 +66,10 @@ class MemoryDirectory implements DirectoryLike {
 }
 
 const pdf = new Blob(['%PDF-1.7 dummy'], { type: 'application/pdf' });
-const base = { baseName: 'manual', markdown: '# 見出し', pdf, confirmOverwrite: () => true };
+const MD = { name: 'manual.md', data: '# 見出し' } as const;
+const PDF = { name: 'manual.pdf', data: pdf } as const;
+const CSS = { name: 'style.css', data: 'p { color: red; }' } as const;
+const base = { files: [MD, PDF], confirmOverwrite: () => true };
 
 describe('writeOutputs', () => {
   it('MDとPDFの両方を書き込む', async () => {
@@ -81,7 +84,7 @@ describe('writeOutputs', () => {
   describe('片方だけ保存', () => {
     it('MDだけ: PDFは書き込まない', async () => {
       const directory = new MemoryDirectory();
-      const report = await writeOutputs({ ...base, directory, pdf: null });
+      const report = await writeOutputs({ ...base, directory, files: [MD] });
 
       expect(report).toEqual({ cancelled: false, written: ['manual.md'], failed: [] });
       expect([...directory.files.keys()]).toEqual(['manual.md']);
@@ -89,7 +92,7 @@ describe('writeOutputs', () => {
 
     it('PDFだけ: MDは書き込まない', async () => {
       const directory = new MemoryDirectory();
-      const report = await writeOutputs({ ...base, directory, markdown: null });
+      const report = await writeOutputs({ ...base, directory, files: [PDF] });
 
       expect(report).toEqual({ cancelled: false, written: ['manual.pdf'], failed: [] });
       expect([...directory.files.keys()]).toEqual(['manual.pdf']);
@@ -103,7 +106,7 @@ describe('writeOutputs', () => {
       const report = await writeOutputs({
         ...base,
         directory,
-        markdown: null,
+        files: [PDF],
         confirmOverwrite: () => {
           asked = true;
           return true;
@@ -124,7 +127,7 @@ describe('writeOutputs', () => {
       await writeOutputs({
         ...base,
         directory,
-        markdown: null,
+        files: [PDF],
         confirmOverwrite: (names) => {
           asked = names;
           return true;
@@ -134,11 +137,31 @@ describe('writeOutputs', () => {
       expect(asked).toEqual(['manual.pdf']);
     });
 
+    it('MD・PDF以外(HTML・固定名のCSS)も、渡した名前のとおりに書き込み、上書き確認の対象にする', async () => {
+      const directory = new MemoryDirectory();
+      directory.files.set('style.css', '古いCSS');
+      let asked: readonly string[] = [];
+
+      const report = await writeOutputs({
+        directory,
+        files: [{ name: '案内.html', data: '<p>本文</p>' }, CSS, PDF],
+        confirmOverwrite: (names) => {
+          asked = names;
+          return true;
+        },
+      });
+
+      expect(asked).toEqual(['style.css']);
+      expect(report.written).toEqual(['案内.html', 'style.css', 'manual.pdf']);
+      expect(directory.files.get('style.css')).toBe('p { color: red; }');
+      expect(directory.files.get('案内.html')).toBe('<p>本文</p>');
+    });
+
     it('1つだけの保存が失敗したら、失敗として報告し、新規ファイルは残さない', async () => {
       const directory = new MemoryDirectory();
       directory.failWrite.add('manual.md');
 
-      const report = await writeOutputs({ ...base, directory, pdf: null });
+      const report = await writeOutputs({ ...base, directory, files: [MD] });
 
       expect(report.written).toEqual([]);
       expect(report.failed).toEqual([{ name: 'manual.md', message: '書き込み失敗: manual.md' }]);

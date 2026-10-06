@@ -1,30 +1,31 @@
 import React, { useCallback, useMemo, useState } from 'react';
+import type { MarkdownDocument } from './documents';
 import { defaultBaseName } from './filename';
-import type { ImportedDocument } from './ImportView';
-import { lintMarkdown, type LintWarning } from './lint';
+import { lintMarkdown } from './lint';
+import type { OutputFile } from './outputMode';
 import OutputPanel from './OutputPanel';
+import { requestPdf } from './pdfClient';
 import RichMarkdownEditor from './RichMarkdownEditor';
+import WarningList from './WarningList';
 
 interface EditViewProps {
-  document: ImportedDocument;
+  document: MarkdownDocument;
   onClose: () => void;
 }
 
 type EditorMode = 'rich' | 'source';
 
-const MAX_LISTED_LINES = 5;
-
-function formatLines(lines: readonly number[]): string {
-  const listed = lines.slice(0, MAX_LISTED_LINES).join('、');
-  const rest = lines.length - MAX_LISTED_LINES;
-  return rest > 0 ? `${listed} ほか${rest}件` : listed;
-}
-
-const WarningItem: React.FC<{ warning: LintWarning }> = ({ warning }) => (
-  <li>
-    {warning.message} <span className="warning-lines">(行: {formatLines(warning.lines)})</span>
-  </li>
-);
+/** 保存できるファイル(Markdown・PDF) */
+const outputFilesOf = (markdown: string): OutputFile[] => [
+  {
+    id: 'markdown',
+    label: 'Markdown (.md)',
+    shortLabel: 'MD',
+    extension: 'md',
+    content: { type: 'text', text: markdown, mimeType: 'text/markdown' },
+  },
+  { id: 'pdf', label: 'PDF (.pdf)', shortLabel: 'PDF', extension: 'pdf', content: { type: 'pdf' } },
+];
 
 /** プレビュー(書式付き編集)とMarkdown(ソース)を切り替えて編集し、出力する画面 */
 const EditView: React.FC<EditViewProps> = ({ document, onClose }) => {
@@ -37,6 +38,7 @@ const EditView: React.FC<EditViewProps> = ({ document, onClose }) => {
   const [parseError, setParseError] = useState<string | null>(null);
 
   const warnings = useMemo(() => lintMarkdown(markdown), [markdown]);
+  const outputFiles = useMemo(() => outputFilesOf(markdown), [markdown]);
 
   const handleParseError = useCallback((message: string) => {
     setParseError(message);
@@ -64,9 +66,9 @@ const EditView: React.FC<EditViewProps> = ({ document, onClose }) => {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>Markdown → PDF エディタ</h1>
+        <h1>Markdown / HTML → PDF エディタ</h1>
         <button type="button" className="button" onClick={close}>
-          別のMDを読み込む
+          別のファイルを読み込む
         </button>
       </header>
 
@@ -75,13 +77,7 @@ const EditView: React.FC<EditViewProps> = ({ document, onClose }) => {
           {document.sourceName === null ? '貼り付けたMarkdown' : document.sourceName}
         </p>
 
-        {warnings.length > 0 && (
-          <ul className="notice notice-warning warning-list" aria-label="確認してください">
-            {warnings.map((warning) => (
-              <WarningItem key={warning.code} warning={warning} />
-            ))}
-          </ul>
-        )}
+        <WarningList warnings={warnings} />
 
         {parseError !== null && (
           <div role="alert" className="notice notice-error">
@@ -140,7 +136,12 @@ const EditView: React.FC<EditViewProps> = ({ document, onClose }) => {
           PDFはサーバ側のフォントで描画されるため、プレビューと字形や改ページ位置が少し異なることがあります。
         </p>
 
-        <OutputPanel markdown={markdown} defaultBaseName={defaultBaseName(document.sourceName)} />
+        <OutputPanel
+          files={outputFiles}
+          defaultBaseName={defaultBaseName(document.sourceName)}
+          generatePdf={() => requestPdf({ kind: 'markdown', text: markdown })}
+          empty={markdown.trim() === ''}
+        />
       </main>
     </div>
   );
