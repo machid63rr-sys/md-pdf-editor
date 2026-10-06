@@ -1,6 +1,6 @@
 import express, { type ErrorRequestHandler, type Express, type NextFunction, type Request, type Response } from 'express';
 import { prepareHtmlForPdf } from './htmlDocument.js';
-import { buildDocumentHtml } from './markdownToHtml.js';
+import { buildDocumentHtml, type MarkdownAssets } from './markdownToHtml.js';
 import { PdfRenderError, type PdfRenderer } from './pdf.js';
 
 export interface AppDependencies {
@@ -42,20 +42,48 @@ function securityHeaders(_req: Request, res: Response, next: NextFunction): void
 interface PdfSource {
   readonly kind: 'markdown' | 'html';
   readonly text: string;
+  // Markdownの相対パスの画像(kindがmarkdownのときだけ)
+  readonly assets?: MarkdownAssets;
 }
 
 const SOURCE_LABEL = { markdown: 'Markdown', html: 'HTML' } as const;
 
-// リクエストは {"markdown": "…"} か {"html": "…"} のどちらか一方
+// 画像の数・パスの長さの上限(巨大なリクエストで、処理が重くならないように)
+const MAX_ASSET_FILES = 1000;
+const MAX_PATH_LENGTH = 1000;
+
+const invalid = (message: string): ApiError => new ApiError(400, 'invalid_request', message);
+
+function parseAssets(baseDir: unknown, assets: unknown): MarkdownAssets | undefined {
+  if (baseDir === undefined && assets === undefined) {
+    return undefined;
+  }
+  if (typeof baseDir !== 'string' || baseDir.length > MAX_PATH_LENGTH) {
+    throw invalid('baseDir は、文字列で指定してください。');
+  }
+  if (typeof assets !== 'object' || assets === null || Array.isArray(assets)) {
+    throw invalid('assets は、{"パス": "data:image/…;base64,…"} の形式で指定してください。');
+  }
+  const entries = Object.entries(assets);
+  if (entries.length > MAX_ASSET_FILES || entries.some(([path, uri]) => path.length > MAX_PATH_LENGTH || typeof uri !== 'string')) {
+    throw invalid(`assets は、パス(${MAX_PATH_LENGTH}文字以内)と文字列の組を、${MAX_ASSET_FILES}個以内で指定してください。`);
+  }
+  return { baseDir, files: Object.fromEntries(entries) as Record<string, string> };
+}
+
+// リクエストは {"markdown": "…"} か {"html": "…"} のどちらか一方。markdownには、画像(baseDir・assets)を添えられる
 function parseSource(body: unknown, maxBytes: number): PdfSource {
-  const { markdown, html } = (body ?? {}) as { markdown?: unknown; html?: unknown };
+  const { markdown, html, baseDir, assets } = (body ?? {}) as { markdown?: unknown; html?: unknown; baseDir?: unknown; assets?: unknown };
   if (markdown !== undefined && html !== undefined) {
-    throw new ApiError(400, 'invalid_request', 'markdown と html は同時に指定できません。どちらか一方を指定してください。');
+    throw invalid('markdown と html は同時に指定できません。どちらか一方を指定してください。');
   }
   const kind = html !== undefined ? 'html' : 'markdown';
   const text = html !== undefined ? html : markdown;
   if (typeof text !== 'string') {
-    throw new ApiError(400, 'invalid_request', 'リクエストは {"markdown": "<文字列>"} または {"html": "<文字列>"} の形式で指定してください。');
+    throw invalid('リクエストは {"markdown": "<文字列>"} または {"html": "<文字列>"} の形式で指定してください。');
+  }
+  if (kind === 'html' && (baseDir !== undefined || assets !== undefined)) {
+    throw invalid('baseDir・assets は、markdown のときだけ指定できます(HTMLは、画像を data: URI にして含めてください)。');
   }
   if (text.trim() === '') {
     throw new ApiError(400, `empty_${kind}`, `${SOURCE_LABEL[kind]}が空です。`);
@@ -63,7 +91,8 @@ function parseSource(body: unknown, maxBytes: number): PdfSource {
   if (Buffer.byteLength(text, 'utf8') > maxBytes) {
     throw new ApiError(413, `${kind}_too_large`, `${SOURCE_LABEL[kind]}が大きすぎます(上限 ${maxBytes} バイト)。`);
   }
-  return { kind, text };
+  const parsedAssets = kind === 'markdown' ? parseAssets(baseDir, assets) : undefined;
+  return parsedAssets === undefined ? { kind, text } : { kind, text, assets: parsedAssets };
 }
 
 export function createApp(deps: AppDependencies): Express {
@@ -83,7 +112,7 @@ export function createApp(deps: AppDependencies): Express {
     const source = parseSource(req.body, deps.maxMarkdownBytes);
     const pdf =
       source.kind === 'markdown'
-        ? await deps.renderer.render(buildDocumentHtml(source.text, deps.css))
+        ? await deps.renderer.render(buildDocumentHtml(source.text, deps.css, source.assets))
         : await deps.renderer.render(prepareHtmlForPdf(source.text), { preferCssPageSize: true });
     res.status(200).type('application/pdf').setHeader('Cache-Control', 'no-store');
     res.send(pdf);

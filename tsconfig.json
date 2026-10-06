@@ -16,5 +16,5 @@
     "noEmit": true,
     "types": ["vite/client", "wicg-file-system-access"]
   },
-  "include": ["src/client"]
+  "include": ["src/client", "src/shared"]
 }

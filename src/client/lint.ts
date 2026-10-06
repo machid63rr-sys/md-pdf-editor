@@ -1,3 +1,4 @@
+import { imageReferencesIn } from './markdownRefs';
 import { forEachLineOutsideFences, splitInlineCode } from './markdownText';
 import { findBrokenTables } from './tableCheck';
 
@@ -19,11 +20,11 @@ export interface LintWarning {
 const MESSAGES: Record<LintCode, string> = {
   'front-matter': '先頭のfront matterは、PDFではYAMLのコードブロックとして表示されます。',
   'broken-table': '表として解釈できない表形式の行があります。PDFでは「|」付きの文字のまま表示されます。',
-  'unsupported-image': 'data URI以外の画像は、PDFには表示されません(「[画像: …]」という文字になります)。',
+  'unsupported-image':
+    '表示できない画像があります(外部のURL、または取り込んだファイルの中に無いもの)。PDFには「[画像: …]」という文字で表示されます。',
   'raw-html': 'HTMLタグ(<br> など)は実行されず、文字としてそのまま表示されます。',
 };
 
-const IMAGE = /!\[[^\]]*\]\(\s*<?([^)\s>]*)/g;
 // タグ名はASCII英字で始まるものだけ(<https://…> の自動リンクや <エラー一覧表> は含めない)
 const RAW_HTML = /<\/?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?\/?>|<!--/;
 
@@ -48,7 +49,12 @@ const withoutInlineCode = (line: string): string =>
     .map((segment) => segment.text)
     .join(' ');
 
-export function lintMarkdown(markdown: string): LintWarning[] {
+const isDataImage = (reference: string): boolean => /^data:image\//i.test(reference.trim());
+
+/**
+ * @param canDisplayImage 参照(相対パスなど)が、取り込んだ画像として表示できるか。省略すると、data URIだけを表示できるとみなす
+ */
+export function lintMarkdown(markdown: string, canDisplayImage?: (reference: string) => boolean): LintWarning[] {
   const frontMatterLines = frontMatterLineCount(markdown);
   const imageLines: number[] = [];
   const htmlLines: number[] = [];
@@ -58,8 +64,8 @@ export function lintMarkdown(markdown: string): LintWarning[] {
       return;
     }
     const prose = withoutInlineCode(line);
-    const hasUnsupportedImage = [...prose.matchAll(IMAGE)].some(
-      (match) => !(match[1] ?? '').toLowerCase().startsWith('data:image/'),
+    const hasUnsupportedImage = imageReferencesIn(prose).some(
+      (reference) => !isDataImage(reference) && canDisplayImage?.(reference) !== true,
     );
     if (hasUnsupportedImage) {
       imageLines.push(lineNumber);

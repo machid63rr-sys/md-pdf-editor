@@ -6,7 +6,7 @@ describe('loadConfig', () => {
     expect(loadConfig({})).toEqual({
       port: 8080,
       host: '0.0.0.0',
-      maxMarkdownBytes: 5 * 1024 * 1024,
+      maxMarkdownBytes: 30 * 1024 * 1024,
       pdfTimeoutMs: 60_000,
       chromiumPath: '/usr/bin/chromium',
     });

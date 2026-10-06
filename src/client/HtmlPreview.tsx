@@ -1,4 +1,5 @@
 import { forwardRef, useCallback, useImperativeHandle, useRef } from 'react';
+import { ORIGINAL_ATTRIBUTE_PREFIX } from './htmlCompose';
 
 /*
  * HTMLのプレビュー。隔離したiframe(スクリプト無効・外部通信遮断)に、文書を表示する。
@@ -53,14 +54,30 @@ const TOOLBAR: readonly (readonly ToolbarButton[])[] = [
   ],
 ];
 
+// プレビュー用に data: URI へ置き換えた画像の参照(srcなど)を、元の値に戻す。
+// 元の値は、置き換えた属性と一緒に、接頭辞つきの属性として残してある(htmlCompose)
+function restoreOriginalAttributes(root: Element): void {
+  for (const element of [root, ...root.querySelectorAll('*')]) {
+    for (const attribute of [...element.attributes]) {
+      if (attribute.name.startsWith(ORIGINAL_ATTRIBUTE_PREFIX)) {
+        element.setAttribute(attribute.name.slice(ORIGINAL_ATTRIBUTE_PREFIX.length), attribute.value);
+        element.removeAttribute(attribute.name);
+      }
+    }
+  }
+}
+
 // iframe内の文書を、<!DOCTYPE> を含めてHTMLにする。outerHTMLだけだとdoctypeが失われ、
-// 標準モード/互換モードの違いで、元のHTMLとは解釈の仕方(要素の入れ子)が変わってしまうため
+// 標準モード/互換モードの違いで、元のHTMLとは解釈の仕方(要素の入れ子)が変わってしまうため。
+// プレビュー用に書き換えた画像の参照は、元の値に戻す(元のHTMLと比べて、画像の参照を編集と取り違えないため)
 export function serializeDocument(doc: Document): string {
   const type = doc.doctype;
   const doctype = type
     ? `<!DOCTYPE ${type.name}${type.publicId ? ` PUBLIC "${type.publicId}"` : ''}${type.systemId ? ` "${type.systemId}"` : ''}>`
     : '';
-  return doctype + doc.documentElement.outerHTML;
+  const root = doc.documentElement.cloneNode(true) as HTMLElement;
+  restoreOriginalAttributes(root);
+  return doctype + root.outerHTML;
 }
 
 const HtmlPreview = forwardRef<HtmlPreviewHandle, HtmlPreviewProps>(function HtmlPreview({ srcDoc, editable, onEdit }, ref) {

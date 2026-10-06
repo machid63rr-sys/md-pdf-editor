@@ -86,6 +86,47 @@ describe('POST /api/pdf', () => {
     expect(renderer.options[0]).toEqual({ preferCssPageSize: true });
   });
 
+  it('Markdownに添えた画像(baseDir・assets)が、相対パスの画像として表示される', async () => {
+    renderer.htmls.length = 0;
+    const dataUri = 'data:image/png;base64,iVBORw==';
+    const res = await postPdf(JSON.stringify({ markdown: '![図](img/a.png)', baseDir: 'docs', assets: { 'docs/img/a.png': dataUri } }));
+    expect(res.status).toBe(200);
+    expect(renderer.htmls[0]).toContain(`<img src="${dataUri}" alt="図">`);
+  });
+
+  it.each([
+    ['baseDirだけ(assetsなし)', { markdown: '# a', baseDir: '' }],
+    ['assetsだけ(baseDirなし)', { markdown: '# a', assets: {} }],
+    ['assetsが配列', { markdown: '# a', baseDir: '', assets: [] }],
+    ['assetsの値が文字列でない', { markdown: '# a', baseDir: '', assets: { 'a.png': 1 } }],
+    ['baseDirが文字列でない', { markdown: '# a', baseDir: 1, assets: {} }],
+    ['HTMLにassets', { html: '<p>a</p>', baseDir: '', assets: {} }],
+  ])('画像の指定が不正(%s)なら400', async (_label, body) => {
+    const res = await postPdf(JSON.stringify(body));
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe('invalid_request');
+  });
+
+  it('画像(assets)が多すぎる場合は400(本文の上限に収まる大きさでも、個数で制限する)', async () => {
+    const roomy = createApp({ maxMarkdownBytes: 1_000_000, renderer, css: '', clientDir, chromiumVersion: 'Chromium/test' });
+    const roomyServer = await new Promise<Server>((resolve) => {
+      const started = roomy.listen(0, '127.0.0.1', () => resolve(started));
+    });
+    try {
+      const { port } = roomyServer.address() as AddressInfo;
+      const assets = Object.fromEntries(Array.from({ length: 1001 }, (_, index) => [`${index}.png`, 'x']));
+      const res = await fetch(`http://127.0.0.1:${port}/api/pdf`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ markdown: '# a', baseDir: '', assets }),
+      });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe('invalid_request');
+    } finally {
+      await new Promise<void>((resolve, reject) => roomyServer.close((error) => (error ? reject(error) : resolve())));
+    }
+  });
+
   it('Markdownの場合は、用紙サイズの指定を尊重しない(従来どおりA4)', async () => {
     renderer.options.length = 0;
     await postPdf(JSON.stringify({ markdown: '# a' }));

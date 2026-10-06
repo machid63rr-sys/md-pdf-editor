@@ -40,6 +40,9 @@ const messageOf = (cause: unknown): string => (cause instanceof Error ? cause.me
 
 // 2つ目以降のダウンロードを、1つ目の開始の直後に発行すると、ブラウザに無視されることがあるため少し間を置く
 const NEXT_DOWNLOAD_DELAY_MS = 400;
+// ダウンロードは、サブフォルダを作れない。「css/style.css」は「style.css」にする
+const downloadNameOf = (name: string): string => name.slice(name.lastIndexOf('/') + 1);
+
 const delay = (ms: number): Promise<void> => new Promise((resolve) => window.setTimeout(resolve, ms));
 
 function describeReport(report: OutputReport, folderName: string): Status {
@@ -137,12 +140,15 @@ const OutputPanel: React.FC<OutputPanelProps> = ({ files, defaultBaseName, gener
           await delay(NEXT_DOWNLOAD_DELAY_MS);
         }
         const blob = entry.data instanceof Blob ? entry.data : new Blob([entry.data], { type: `${entry.mimeType};charset=utf-8` });
-        downloadBlob(blob, entry.name);
+        downloadBlob(blob, downloadNameOf(entry.name));
       }
-      const names = entries.map((entry) => entry.name);
+      const names = entries.map((entry) => downloadNameOf(entry.name));
+      const flattened = entries.some((entry) => entry.name.includes('/'));
       setStatus({
         kind: 'success',
-        text: `ダウンロードを開始しました: ${names.join('、')} (保存先はブラウザのダウンロード設定に従います${names.length > 1 ? '。複数ファイルのダウンロードを確認された場合は、許可してください' : ''})`,
+        text:
+          `ダウンロードを開始しました: ${names.join('、')} (保存先はブラウザのダウンロード設定に従います${names.length > 1 ? '。複数ファイルのダウンロードを確認された場合は、許可してください' : ''})` +
+          (flattened ? ' ダウンロードでは、サブフォルダを作れないため、CSSはファイル名だけで保存されます。HTMLが指している位置(例: css/style.css)に保存するには、「出力先フォルダを選択」を使ってください。' : ''),
       });
     } catch (cause) {
       setStatus({ kind: 'error', text: messageOf(cause) });

@@ -32,6 +32,13 @@ describe('lintMarkdown', () => {
       expect(linesOf('![図](./a.png)', 'unsupported-image')).toEqual([1]);
     });
 
+    it('取り込んだ画像として表示できる参照は警告しない(表示できないものだけ警告する)', () => {
+      const canDisplay = (reference: string): boolean => reference === 'images/a.png' || reference === '日本 図.png';
+      expect(lintMarkdown('![図](images/a.png)\n![図](<日本 図.png>)', canDisplay)).toEqual([]);
+      const warnings = lintMarkdown('![図](images/a.png)\n![図](images/none.png)\n![図](https://example.com/a.png)', canDisplay);
+      expect(warnings.map((warning) => [warning.code, warning.lines])).toEqual([['unsupported-image', [2, 3]]]);
+    });
+
     it('data URIの画像は警告しない(大文字小文字を問わない)', () => {
       expect(codes('![p](data:image/png;base64,AAAA)')).toEqual([]);
       expect(codes('![p](DATA:image/png;base64,AAAA)')).toEqual([]);

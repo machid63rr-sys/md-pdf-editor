@@ -14,5 +14,5 @@
     "noEmit": true,
     "types": ["node", "wicg-file-system-access"]
   },
-  "include": ["src/server", "tests", "vite.config.ts", "vitest.config.ts"]
+  "include": ["src/server", "src/shared", "tests", "vite.config.ts", "vitest.config.ts"]
 }

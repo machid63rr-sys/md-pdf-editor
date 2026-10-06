@@ -13,6 +13,7 @@ const notFound = (): Error => Object.assign(new Error('not found'), { name: 'Not
 // メモリ上のフォルダ。実物と同じく、close()されるまで内容は確定せず、abort()で破棄される
 class MemoryDirectory implements DirectoryLike {
   readonly files = new Map<string, string>();
+  readonly directories = new Map<string, MemoryDirectory>();
   readonly aborted: string[] = [];
   // 指定したファイル名への書き込み(write)を失敗させる
   failWrite = new Set<string>();
@@ -20,6 +21,18 @@ class MemoryDirectory implements DirectoryLike {
   failLookup = new Set<string>();
   // 指定したファイル名の削除(removeEntry)を失敗させる
   failRemove = new Set<string>();
+
+  getDirectoryHandle(name: string, options?: { create?: boolean }): Promise<DirectoryLike> {
+    let child = this.directories.get(name);
+    if (child === undefined) {
+      if (options?.create !== true) {
+        return Promise.reject(notFound());
+      }
+      child = new MemoryDirectory();
+      this.directories.set(name, child);
+    }
+    return Promise.resolve(child);
+  }
 
   removeEntry(name: string): Promise<void> {
     if (this.failRemove.has(name)) {
@@ -167,6 +180,53 @@ describe('writeOutputs', () => {
       expect(report.failed).toEqual([{ name: 'manual.md', message: '書き込み失敗: manual.md' }]);
       expect(directory.files.size).toBe(0);
     });
+  });
+
+  describe('サブフォルダ', () => {
+    it('サブフォルダつきの名前(css/style.css)は、サブフォルダを作って書き込む', async () => {
+      const directory = new MemoryDirectory();
+      const report = await writeOutputs({ ...base, directory, files: [MD, { name: 'css/sub/style.css', data: 'p{}' }] });
+
+      expect(report.written).toEqual(['manual.md', 'css/sub/style.css']);
+      expect(directory.directories.get('css')?.directories.get('sub')?.files.get('style.css')).toBe('p{}');
+      expect(directory.files.has('style.css')).toBe(false);
+    });
+
+    it('サブフォルダの既存ファイルは、上書き確認の対象になる(サブフォルダが無ければ、確認しない)', async () => {
+      const directory = new MemoryDirectory();
+      let asked: readonly string[] | undefined;
+      const confirmOverwrite = (names: readonly string[]): boolean => {
+        asked = names;
+        return true;
+      };
+      await writeOutputs({ ...base, directory, files: [{ name: 'css/style.css', data: 'a' }], confirmOverwrite });
+      expect(asked).toBeUndefined();
+
+      await writeOutputs({ ...base, directory, files: [{ name: 'css/style.css', data: 'b' }], confirmOverwrite });
+      expect(asked).toEqual(['css/style.css']);
+      expect(directory.directories.get('css')?.files.get('style.css')).toBe('b');
+    });
+
+    it('サブフォルダに書き込む途中で失敗した新規ファイルは、残さない', async () => {
+      const directory = new MemoryDirectory();
+      const sub = (await directory.getDirectoryHandle('css', { create: true })) as MemoryDirectory;
+      sub.failWrite.add('style.css');
+
+      const report = await writeOutputs({ ...base, directory, files: [{ name: 'css/style.css', data: 'p{}' }] });
+
+      expect(report.failed).toEqual([{ name: 'css/style.css', message: '書き込み失敗: style.css' }]);
+      expect(sub.files.has('style.css')).toBe(false);
+    });
+
+    it.each(['../outside.css', 'a/../../b.css', '/abs.css', 'a//b.css', './a.css', 'a\\b.css', 'c:evil.css', ''])(
+      '保存先の外へ出る・不正な名前(%j)は、何も書かずに断る',
+      async (name) => {
+        const directory = new MemoryDirectory();
+        await expect(writeOutputs({ ...base, directory, files: [MD, { name, data: 'x' }] })).rejects.toThrowError('名前が不正です');
+        expect(directory.files.size).toBe(0);
+        expect(directory.directories.size).toBe(0);
+      },
+    );
   });
 
   describe('既存ファイル', () => {

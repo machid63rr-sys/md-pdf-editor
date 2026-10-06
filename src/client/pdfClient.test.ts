@@ -28,6 +28,20 @@ describe('requestPdf', () => {
     expect(await blob.text()).toBe('%PDF-1.7 dummy');
   });
 
+  it('Markdownに添えた画像は、baseDirとassetsとして送る(画像が無ければ、含めない)', async () => {
+    const bodies: unknown[] = [];
+    const fetchFn: FetchLike = (_input, init) => {
+      bodies.push(JSON.parse(String(init.body)));
+      return Promise.resolve(pdfResponse());
+    };
+    await requestPdf({ kind: 'markdown', text: '![図](a.png)', baseDir: 'docs', assets: { 'docs/a.png': 'data:image/png;base64,AAAA' } }, fetchFn);
+    await requestPdf({ kind: 'markdown', text: '本文', baseDir: 'docs', assets: {} }, fetchFn);
+    expect(bodies).toEqual([
+      { markdown: '![図](a.png)', baseDir: 'docs', assets: { 'docs/a.png': 'data:image/png;base64,AAAA' } },
+      { markdown: '本文' },
+    ]);
+  });
+
   it('HTMLは {html: …} としてPOSTする', async () => {
     let body: unknown;
     const fetchFn: FetchLike = (_input, init) => {

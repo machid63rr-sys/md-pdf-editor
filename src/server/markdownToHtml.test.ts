@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildDocumentHtml, renderMarkdown } from './markdownToHtml.js';
+import { buildDocumentHtml, renderMarkdown, type MarkdownAssets } from './markdownToHtml.js';
 
 const body = (markdown: string): string => renderMarkdown(markdown).bodyHtml;
 
@@ -93,10 +93,60 @@ describe('renderMarkdown', () => {
       expect(html).toContain('[画像: 外部](https://example.com/a.png)');
     });
 
-    it('svgのdata URIは対象外として文字にする', () => {
-      const html = body('![s](data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=)');
-      expect(html).not.toContain('<img');
-      expect(html).toContain('[画像: s](');
+    it('svgのdata URIも画像として表示する(<img>の中では、スクリプトの実行も外部の読み込みも行われない)', () => {
+      const svg = 'data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=';
+      expect(body(`![s](${svg})`)).toContain(`<img src="${svg}" alt="s">`);
+    });
+
+    it('画像として許可していない種類・形のdata URIは、文字にする', () => {
+      for (const src of ['data:text/html;base64,PHNjcmlwdD4=', 'data:image/svg+xml;utf8,AAA', 'data:application/pdf;base64,AAAA']) {
+        const html = body(`![x](${src})`);
+        expect(html).not.toContain('<img');
+        expect(html).toContain('[画像: x](');
+      }
+    });
+
+    describe('取り込んだ画像(assets)', () => {
+      const assets: MarkdownAssets = { baseDir: 'docs', files: { 'docs/img/a.png': dataUri, 'shared/b.png': dataUri } };
+      const render = (markdown: string, given: MarkdownAssets = assets): string => renderMarkdown(markdown, given).bodyHtml;
+
+      it('Markdownのフォルダを基準にした相対パスの画像を、渡された画像で表示する(元のパスは変わらず、src だけが置き換わる)', () => {
+        expect(render('![図](img/a.png)')).toContain(`<img src="${dataUri}" alt="図">`);
+        expect(render('![図](./img/a.png?v=2)')).toContain(`<img src="${dataUri}"`);
+        expect(render('![図](../shared/b.png)')).toContain(`<img src="${dataUri}"`);
+        expect(render('![図](/shared/b.png)')).toContain(`<img src="${dataUri}"`);
+      });
+
+      it('参照形式・空白を含むパス・パーセントエンコードされたパスの画像も表示する', () => {
+        const files = { 'docs/my img/日本.png': dataUri };
+        expect(render('![図][a]\n\n[a]: img/a.png', assets)).toContain(`<img src="${dataUri}"`);
+        expect(render('![図](<my img/日本.png>)', { baseDir: 'docs', files })).toContain(`<img src="${dataUri}"`);
+        expect(render('![図](my%20img/%E6%97%A5%E6%9C%AC.png)', { baseDir: 'docs', files })).toContain(`<img src="${dataUri}"`);
+      });
+
+      it('渡されていない画像・外部URL・ルートの外を指す画像は、文字にする', () => {
+        for (const markdown of ['![x](img/none.png)', '![x](https://example.com/a.png)', '![x](../../a.png)']) {
+          const html = render(markdown);
+          expect(html).not.toContain('<img');
+          expect(html).toContain('[画像: x](');
+        }
+      });
+
+      it('渡された値が画像のdata URIでなければ、信用せず、文字にする', () => {
+        const html = render('![x](img/a.png)', { baseDir: 'docs', files: { 'docs/img/a.png': 'javascript:alert(1)' } });
+        expect(html).not.toContain('<img');
+        expect(html).toContain('[画像: x](img/a.png)');
+      });
+
+      it('画像が渡されていなければ、相対パスの画像は文字にする(従来どおり)', () => {
+        const html = renderMarkdown('![x](img/a.png)').bodyHtml;
+        expect(html).not.toContain('<img');
+        expect(html).toContain('[画像: x](img/a.png)');
+      });
+
+      it('Object.prototypeのプロパティ名のパスを指しても、画像にならない', () => {
+        expect(render('![x](constructor)', { baseDir: '', files: {} })).not.toContain('<img');
+      });
     });
   });
 

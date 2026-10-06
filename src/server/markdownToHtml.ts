@@ -9,6 +9,7 @@ import { visit, SKIP } from 'unist-util-visit';
 import { toString } from 'mdast-util-to-string';
 import type { Root as MdastRoot, Heading, PhrasingContent, RootContent } from 'mdast';
 import type { Root as HastRoot } from 'hast';
+import { classifyReference } from '../shared/assetPath.js';
 
 /*
  * Markdown → HTML(PDF用)。
@@ -16,11 +17,13 @@ import type { Root as HastRoot } from 'hast';
  * - front matter(YAML)は、内容を失わないようコードブロックとして表示する
  * - 段落内の改行はすべて改行として扱う(編集画面の表示と揃えるため)
  * - リンクは http/https/mailto/tel と相対URLのみ有効。それ以外は「文字 (URL)」に置き換える
- * - 画像は data URI(png/jpeg/gif/webp)のみ表示。それ以外は「[画像: 代替文](URL)」の文字にする
+ * - 画像は、data URI(png/jpeg/gif/webp/svg)と、リクエストで渡された画像(assets)だけ表示する。
+ *   それ以外(外部URL・渡されていないファイル)は「[画像: 代替文](URL)」の文字にする
+ *   (svgは<img>の中では、スクリプトの実行も外部の読み込みも行われない)
  */
 
 const ALLOWED_LINK_PROTOCOLS = new Set(['http:', 'https:', 'mailto:', 'tel:']);
-const DATA_IMAGE_URL = /^data:image\/(?:png|jpe?g|gif|webp);base64,[A-Za-z0-9+/=]+$/i;
+const DATA_IMAGE_URL = /^data:image\/(?:png|jpe?g|gif|webp|svg\+xml);base64,[A-Za-z0-9+/=]+$/i;
 const FLOW_PARENTS = new Set(['root', 'blockquote', 'listItem', 'footnoteDefinition']);
 
 function isAllowedLink(url: string): boolean {
@@ -64,9 +67,34 @@ function remarkNeutralizeRawContent() {
   };
 }
 
+// Markdownの中の相対パスの画像に使える、画像の一覧。キーは、取り込んだ一式のルートからの相対パス
+export interface MarkdownAssets {
+  // Markdownがあるフォルダ(相対パスの基準)
+  readonly baseDir: string;
+  // パス -> data URI。値は、使う前に検査する(クライアントから渡されたものを信用しない)
+  readonly files: Readonly<Record<string, string>>;
+}
+
+// 画像のsrcを、表示してよいdata URIにする。表示できなければ undefined
+function displayableImage(src: string, assets: MarkdownAssets | undefined): string | undefined {
+  if (DATA_IMAGE_URL.test(src)) {
+    return src;
+  }
+  if (assets === undefined) {
+    return undefined;
+  }
+  const reference = classifyReference(src, assets.baseDir);
+  if (reference.kind !== 'local' || reference.path === null) {
+    return undefined;
+  }
+  const uri = Object.hasOwn(assets.files, reference.path) ? assets.files[reference.path] : undefined;
+  return uri !== undefined && DATA_IMAGE_URL.test(uri) ? uri : undefined;
+}
+
 // 参照形式(定義+参照)や自動リンクを含め、HTMLに変換された後のURLをまとめて検査する
 function rehypeNeutralizeUrls() {
-  return (tree: HastRoot): void => {
+  return (tree: HastRoot, file: { data: object }): void => {
+    const assets = (file.data as { markdownAssets?: MarkdownAssets }).markdownAssets;
     visit(tree, 'element', (node, index, parent) => {
       if (node.tagName === 'a') {
         const href = node.properties['href'];
@@ -78,7 +106,9 @@ function rehypeNeutralizeUrls() {
       }
       if (node.tagName === 'img' && parent !== undefined && index !== undefined) {
         const src = node.properties['src'];
-        if (typeof src === 'string' && DATA_IMAGE_URL.test(src)) {
+        const displayable = typeof src === 'string' ? displayableImage(src, assets) : undefined;
+        if (displayable !== undefined) {
+          node.properties['src'] = displayable;
           return undefined;
         }
         const alt = typeof node.properties['alt'] === 'string' ? node.properties['alt'] : '';
@@ -123,16 +153,16 @@ export interface RenderedMarkdown {
   readonly bodyHtml: string;
 }
 
-export function renderMarkdown(markdown: string): RenderedMarkdown {
+export function renderMarkdown(markdown: string, assets?: MarkdownAssets): RenderedMarkdown {
   const mdast = processor.parse(markdown);
   const title = extractTitle(mdast);
-  const hast = processor.runSync(mdast) as HastRoot;
+  const hast = processor.runSync(mdast, { data: { markdownAssets: assets } }) as HastRoot;
   return { title, bodyHtml: String(processor.stringify(hast)) };
 }
 
 // PDF化するHTML全体。メタタグのCSPは、Chromium側の通信遮断に加えた二重の防御
-export function buildDocumentHtml(markdown: string, css: string): string {
-  const { title, bodyHtml } = renderMarkdown(markdown);
+export function buildDocumentHtml(markdown: string, css: string, assets?: MarkdownAssets): string {
+  const { title, bodyHtml } = renderMarkdown(markdown, assets);
   return [
     '<!doctype html>',
     '<html lang="ja"><head><meta charset="utf-8">',

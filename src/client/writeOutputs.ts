@@ -1,5 +1,6 @@
 /*
  * 選択された出力先フォルダへ、選ばれたファイル(MD・HTML・CSS・PDFなど、1つ以上)を書き込む。
+ * ファイル名には、サブフォルダを含められる(例: css/style.css)。無ければ、サブフォルダを作る。
  * File System Access API の型そのものではなく、必要な操作だけを表すインターフェースに依存する
  * (実物の FileSystemDirectoryHandle はそのまま渡せる。テストでは、メモリ上の実装を渡す)。
  */
@@ -16,6 +17,7 @@ export interface FileHandleLike {
 
 export interface DirectoryLike {
   getFileHandle(name: string, options?: { create?: boolean }): Promise<FileHandleLike>;
+  getDirectoryHandle(name: string, options?: { create?: boolean }): Promise<DirectoryLike>;
   removeEntry(name: string): Promise<void>;
 }
 
@@ -25,7 +27,7 @@ export interface PermissionLike {
 }
 
 export interface OutputEntry {
-  // ファイル名(拡張子つき。検証済みであること)
+  // ファイル名(拡張子つき。サブフォルダを含む場合は '/' 区切り)
   readonly name: string;
   readonly data: string | Blob;
 }
@@ -55,13 +57,33 @@ const messageOf = (cause: unknown): string => (cause instanceof Error ? cause.me
 const isNotFound = (cause: unknown): boolean =>
   typeof cause === 'object' && cause !== null && (cause as { name?: unknown }).name === 'NotFoundError';
 
-async function exists(directory: DirectoryLike, name: string): Promise<boolean> {
+// 'css/style.css' -> ['css', 'style.css']。保存先の外へ出る書き方('..')や、使えない文字は、書き込む前に断る
+function segmentsOf(path: string): string[] {
+  const segments = path.split('/');
+  if (segments.some((segment) => segment === '' || segment === '.' || segment === '..' || /[\\:*?"<>|\u0000-\u001f]/.test(segment))) {
+    throw new Error(`保存するファイルの名前が不正です: ${path}`);
+  }
+  return segments;
+}
+
+// ファイルを置くフォルダ(サブフォルダ)を開く。create なら、無いフォルダは作る
+async function parentOf(root: DirectoryLike, segments: readonly string[], create: boolean): Promise<DirectoryLike> {
+  let current = root;
+  for (const segment of segments.slice(0, -1)) {
+    current = await current.getDirectoryHandle(segment, { create });
+  }
+  return current;
+}
+
+async function exists(root: DirectoryLike, path: string): Promise<boolean> {
+  const segments = segmentsOf(path);
   try {
-    await directory.getFileHandle(name);
+    const directory = await parentOf(root, segments, false);
+    await directory.getFileHandle(segments[segments.length - 1] as string);
     return true;
   } catch (cause) {
     if (isNotFound(cause)) {
-      return false;
+      return false; // ファイルが無い。または、置くサブフォルダが、まだ無い
     }
     // 同名のフォルダがある、権限が無いなど、存在確認自体ができない場合は、書き込みに進まず呼び出し元へ伝える
     throw cause;
@@ -70,7 +92,10 @@ async function exists(directory: DirectoryLike, name: string): Promise<boolean> 
 
 // 書き込みは一時領域へ行われ、close()で確定する。失敗時はabort()で破棄し、壊れた内容を残さない。
 // 新規作成したファイルは、作成時点で空ファイルができているため、失敗時にそれも削除する
-async function writeFile(directory: DirectoryLike, name: string, data: string | Blob, existedBefore: boolean): Promise<void> {
+async function writeFile(root: DirectoryLike, path: string, data: string | Blob, existedBefore: boolean): Promise<void> {
+  const segments = segmentsOf(path);
+  const name = segments[segments.length - 1] as string;
+  const directory = await parentOf(root, segments, true);
   const handle = await directory.getFileHandle(name, { create: true });
   const writable = await handle.createWritable();
   try {
@@ -94,6 +119,10 @@ async function writeFile(directory: DirectoryLike, name: string, data: string | 
 }
 
 export async function writeOutputs(request: OutputRequest): Promise<OutputReport> {
+  // 不正な名前が1つでもあれば、何も書かずに断る
+  for (const { name } of request.files) {
+    segmentsOf(name);
+  }
   const existing: string[] = [];
   for (const { name } of request.files) {
     if (await exists(request.directory, name)) {

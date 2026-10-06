@@ -4,6 +4,9 @@ export class PdfRequestError extends Error {}
 export interface PdfSource {
   readonly kind: 'markdown' | 'html';
   readonly text: string;
+  // Markdownの相対パスの画像(取り込んだ画像のdata: URI)。baseDirは、Markdownがあるフォルダ。HTMLは、画像を埋め込み済みで渡す
+  readonly baseDir?: string;
+  readonly assets?: Readonly<Record<string, string>>;
 }
 
 export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
@@ -22,6 +25,14 @@ async function readErrorMessage(response: Response): Promise<string> {
   return `サーバがエラーを返しました (HTTP ${response.status})。`;
 }
 
+function requestBody(source: PdfSource): Record<string, unknown> {
+  if (source.kind === 'html') {
+    return { html: source.text };
+  }
+  const hasAssets = source.assets !== undefined && Object.keys(source.assets).length > 0;
+  return hasAssets ? { markdown: source.text, baseDir: source.baseDir ?? '', assets: source.assets } : { markdown: source.text };
+}
+
 /** 現在のMarkdownまたはHTMLからPDFを生成する。失敗した場合は、利用者に見せられるメッセージつきで例外にする */
 export async function requestPdf(source: PdfSource, fetchFn: FetchLike = defaultFetch): Promise<Blob> {
   let response: Response;
@@ -29,7 +40,7 @@ export async function requestPdf(source: PdfSource, fetchFn: FetchLike = default
     response = await fetchFn('/api/pdf', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(source.kind === 'html' ? { html: source.text } : { markdown: source.text }),
+      body: JSON.stringify(requestBody(source)),
     });
   } catch {
     throw new PdfRequestError('サーバに接続できませんでした。アプリが起動しているか確認してください。');

@@ -31,6 +31,8 @@ interface RichMarkdownEditorProps {
   onChange: (markdown: string) => void;
   // Markdownを書式付きで解釈できなかった場合(サイレントに握りつぶさず親へ通知する)
   onParseError: (message: string) => void;
+  // 画像の参照(相対パスなど)を、エディタ内に表示できるURL(data: URIなど)にする。Markdownの本文は書き換えない
+  resolveImage: (source: string) => Promise<string>;
 }
 
 // 一覧に無い言語のコードブロックも、解釈エラーにならず通常どおり扱われる(実測済み)
@@ -68,8 +70,9 @@ const CODE_BLOCK_LANGUAGES = {
  * - 初期表示時にエディタが行う整形(空白・記号の正規化)は編集として扱わない。
  *   利用者が触っていない本文が、取り込んだMarkdownから勝手に書き換わるのを避けるため。
  * - 解釈できない記法(脚注・参照形式のリンクなど)があると onParseError で通知する
+ * - 取り込んだ画像(相対パスの画像)は、resolveImage で表示用のURLにして表示する
  */
-const RichMarkdownEditor: React.FC<RichMarkdownEditorProps> = ({ initialMarkdown, onChange, onParseError }) => (
+const RichMarkdownEditor: React.FC<RichMarkdownEditorProps> = ({ initialMarkdown, onChange, onParseError, resolveImage }) => (
   <MDXEditor
     className="md-editor"
     contentEditableClassName="md-editor-content"
@@ -87,7 +90,7 @@ const RichMarkdownEditor: React.FC<RichMarkdownEditorProps> = ({ initialMarkdown
       thematicBreakPlugin(),
       linkPlugin(),
       tablePlugin(),
-      imagePlugin(),
+      imagePlugin({ imagePreviewHandler: resolveImage }),
       frontmatterPlugin(),
       codeBlockPlugin({ defaultCodeBlockLanguage: 'txt' }),
       codeMirrorPlugin({ codeBlockLanguages: CODE_BLOCK_LANGUAGES }),

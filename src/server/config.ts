@@ -12,7 +12,8 @@ type Env = Readonly<Record<string, string | undefined>>;
 
 const DEFAULT_PORT = 8080;
 const DEFAULT_HOST = '0.0.0.0';
-const DEFAULT_MAX_MARKDOWN_BYTES = 5 * 1024 * 1024;
+// 文書に含まれる画像(data: URIにするため、元のファイルの約1.3倍になる)を含めた大きさ
+const DEFAULT_MAX_MARKDOWN_BYTES = 30 * 1024 * 1024;
 const DEFAULT_PDF_TIMEOUT_MS = 60_000;
 const DEFAULT_CHROMIUM_PATH = '/usr/bin/chromium';
 

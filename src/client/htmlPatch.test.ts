@@ -164,6 +164,16 @@ describe('構造の編集(段落の分割・太字・削除・追加)', () => {
 });
 
 describe('スタイル・スクリプト', () => {
+  it('<style>の中身がプレビュー用に書き換えられていても(画像の埋め込みなど)、差分とみなさない', () => {
+    const source = '<body><style>p { background: url(a.png) }</style><p>x</p></body>';
+    const preview = edited('<style>p { background: url("data:image/png;base64,AAAA") }</style><p>x</p>');
+    expect(patch(source, preview)).toBe(source);
+    // 他の部分の編集は反映される
+    expect(patch(source, edited('<style>p { background: url("data:image/png;base64,AAAA") }</style><p>xy</p>'))).toBe(
+      '<body><style>p { background: url(a.png) }</style><p>xy</p></body>',
+    );
+  });
+
   it('<style>の中身は、編集していない限り変わらない(エスケープされない)', () => {
     const source = '<body><style>a>b { margin: 0 }</style><p>x</p></body>';
     expect(patch(source, edited('<style>a>b { margin: 0 }</style><p>xy</p>'))).toBe(

@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createServer, type Server } from 'node:http';
@@ -210,7 +211,7 @@ describe('画面操作(実ブラウザ)', () => {
     const warnings = await page.$eval('.warning-list', (element) => (element as HTMLElement).innerText);
     expect(warnings).toContain('front matter');
     expect(warnings).toContain('HTMLタグ');
-    expect(warnings).toContain('data URI以外の画像');
+    expect(warnings).toContain('表示できない画像');
     await shot('5-warnings');
   });
 
@@ -821,8 +822,9 @@ describe('画面操作(実ブラウザ)', () => {
         await page.keyboard.type('(追記)');
         await settle();
 
+        // HTMLが css/style.css を指しているため、CSSも、HTMLと同じ出力フォルダの css/style.css に保存する
         const labels = await page.$$eval('.file-select label', (items) => items.map((item) => item.textContent?.trim()));
-        expect(labels).toEqual(['HTML (.html)', 'CSS (style.css)', 'PDF (.pdf)']);
+        expect(labels).toEqual(['HTML (.html)', 'CSS (css/style.css)', 'PDF (.pdf)']);
         await clickButton('出力先フォルダを選択');
         await page.waitForFunction(
           () => !([...document.querySelectorAll('button')].find((b) => b.textContent?.includes('選んだフォルダへHTMLとCSSとPDFを出力'))?.disabled ?? true),
@@ -840,11 +842,11 @@ describe('画面操作(実ブラウザ)', () => {
           return {
             names: names.sort(),
             html: await read('index.html'),
-            css: await read('style.css'),
+            css: await (await (await dir.getDirectoryHandle('css')).getFileHandle('style.css')).getFile().then((f) => f.text()),
             pdfHeader: (await read('index.pdf')).slice(0, 5),
           };
         });
-        expect(saved.names).toEqual(['index.html', 'index.pdf', 'style.css']);
+        expect(saved.names).toEqual(['css', 'index.html', 'index.pdf']);
         expect(saved.html).toBe(PAGE.replace('<p>本文</p>', '<p>本文(追記)</p>'));
         expect(saved.css).toBe('h1 { color: rgb(204, 0, 0); }');
         expect(saved.pdfHeader).toBe('%PDF-');
@@ -856,7 +858,7 @@ describe('画面操作(実ブラウザ)', () => {
         await upload(files().html, files().css);
         await previewFrame();
         await page.evaluate(() => {
-          for (const text of ['CSS (style.css)', 'PDF (.pdf)']) {
+          for (const text of ['CSS (css/style.css)', 'PDF (.pdf)']) {
             const input = [...document.querySelectorAll('.file-select label')].find((l) => l.textContent?.includes(text))?.querySelector('input');
             (input as HTMLInputElement).click();
           }
@@ -904,6 +906,273 @@ describe('画面操作(実ブラウザ)', () => {
         expect(warnings).toContain('追加して適用');
       });
     });
+  describe('フォルダごとの取り込みと画像(実ブラウザ)', () => {
+    // 1x1のPNG
+    const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    interface Entry {
+      path: string;
+      text?: string;
+      base64?: string;
+    }
+
+    // フォルダの選択ダイアログは操作できないため、「選んだフォルダ内のファイル(相対パスつき)」を、フォルダ選択の入力へ渡す
+    async function importFolder(entries: Entry[], root = 'site'): Promise<void> {
+      await page.goto(baseUrl);
+      await page.waitForSelector('input[aria-label="フォルダを選択"]', { hidden: true });
+      await page.evaluate(
+        (items, rootName) => {
+          const input = document.querySelector('input[aria-label="フォルダを選択"]') as HTMLInputElement;
+          const files = items.map((item) => {
+            const bytes = item.base64 !== undefined ? Uint8Array.from(atob(item.base64), (c) => c.charCodeAt(0)) : new TextEncoder().encode(item.text ?? '');
+            const file = new File([bytes], item.path.split('/').pop() as string);
+            Object.defineProperty(file, 'webkitRelativePath', { value: `${rootName}/${item.path}` });
+            return file;
+          });
+          Object.defineProperty(input, 'files', { value: files, configurable: true });
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        },
+        entries,
+        root,
+      );
+    }
+
+    const SETTLE_MS = 400;
+    const settleAfterEdit = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
+
+    const waitForPreviewFrame = async (): Promise<Frame> => {
+      await page.waitForFunction(
+        () => (document.querySelector('iframe.html-preview-frame') as HTMLIFrameElement | null)?.contentDocument?.designMode === 'on',
+        { timeout: 30_000 },
+      );
+      return (await (await page.$('iframe.html-preview-frame'))?.contentFrame()) as Frame;
+    };
+
+    const imageLoadedIn = (frame: Frame): Promise<unknown> =>
+      frame.waitForFunction(() => {
+        const image = document.querySelector('img');
+        return image !== null && image.complete && image.naturalWidth > 0;
+      });
+
+    const pdfImageCount = (bytes: number[]): number => {
+      const path = join(mkdtempSync(join(tmpdir(), 'md-pdf-editor-pdfimg-')), 'out.pdf');
+      writeFileSync(path, Buffer.from(bytes));
+      return execFileSync('pdfimages', ['-list', path], { encoding: 'utf8' })
+        .split('\n')
+        .filter((line) => /^\s*\d+\s+\d+\s+image\b/.test(line)).length;
+    };
+
+    const outputTo = async (label: string): Promise<void> => {
+      await clickButton('出力先フォルダを選択');
+      await page.waitForFunction(
+        (text) => !([...document.querySelectorAll('button')].find((b) => b.textContent?.includes(text))?.disabled ?? true),
+        {},
+        label,
+      );
+      await clickButton(label);
+      await page.waitForSelector('.notice-success', { timeout: 60_000 });
+    };
+
+    const readOpfs = (path: string): Promise<number[] | null> =>
+      page.evaluate(async (target) => {
+        let dir = await navigator.storage.getDirectory();
+        const segments = target.split('/');
+        try {
+          for (const segment of segments.slice(0, -1)) {
+            dir = await dir.getDirectoryHandle(segment);
+          }
+          const file = await (await dir.getFileHandle(segments[segments.length - 1] as string)).getFile();
+          return [...new Uint8Array(await file.arrayBuffer())];
+        } catch {
+          return null;
+        }
+      }, path);
+
+    const listOpfsRoot = (): Promise<string[]> =>
+      page.evaluate(async () => {
+        const dir = await navigator.storage.getDirectory();
+        const names: string[] = [];
+        for await (const name of (dir as unknown as { keys(): AsyncIterable<string> }).keys()) {
+          names.push(name);
+        }
+        return names.sort();
+      });
+
+    const INDEX_HTML =
+      '<!DOCTYPE html>\n<html>\n<head>\n<link rel="stylesheet" href="css/style.css">\n</head>\n<body>\n<h1>見出し</h1>\n<p>本文</p>\n<img src="images/a.png" alt="図">\n</body>\n</html>\n';
+    const SITE: Entry[] = [
+      { path: 'index.html', text: INDEX_HTML },
+      { path: 'css/style.css', text: 'h1 { color: rgb(204, 0, 0); }\nbody { background: url(../images/bg.png) }' },
+      { path: 'css/unused.css', text: 'p { color: blue }' },
+      { path: 'images/a.png', base64: PNG },
+      { path: 'images/bg.png', base64: PNG },
+    ];
+
+    it('HTMLを含むフォルダを取り込むと、参照しているCSS・画像が、フォルダ内の位置のとおりに読み込まれて表示される', async () => {
+      await importFolder(SITE);
+      const frame = await waitForPreviewFrame();
+      await imageLoadedIn(frame);
+
+      expect(await frame.$eval('h1', (element) => getComputedStyle(element).color)).toBe('rgb(204, 0, 0)');
+      // CSS内の url(../images/bg.png) は、CSSのフォルダを基準に解決される
+      expect(await frame.$eval('body', (element) => getComputedStyle(element).backgroundImage)).toContain('blob:');
+      // HTMLが参照しているCSSだけを取り込む(フォルダ内の他のCSSは取り込まない)
+      expect(await page.$$eval('.tab', (tabs) => tabs.map((tab) => tab.textContent))).toEqual(['プレビュー(直接編集)', 'HTML', 'CSS: css/style.css']);
+      expect(await page.$('.warning-list')).toBeNull();
+      expect(consoleErrors).toEqual([]);
+      await shot('15-folder-html');
+    });
+
+    it('編集していなければ、画像を埋め込んだプレビューから差分を取っても、HTMLの画像の参照は変わらない', async () => {
+      await importFolder(SITE);
+      const frame = await waitForPreviewFrame();
+      await imageLoadedIn(frame);
+      await frame.evaluate(() => document.dispatchEvent(new Event('input')));
+      await settleAfterEdit();
+
+      await clickButton('HTML');
+      await page.waitForSelector('textarea[aria-label="HTML"]');
+      expect(await page.$eval('textarea[aria-label="HTML"]', (element) => (element as HTMLTextAreaElement).value)).toBe(INDEX_HTML);
+    });
+
+    it('プレビューで文字を編集しても、画像の参照(images/a.png)は、data: URIに書き換わらない', async () => {
+      await importFolder(SITE);
+      const frame = await waitForPreviewFrame();
+      await imageLoadedIn(frame);
+      await (await page.$('iframe.html-preview-frame'))?.click();
+      await frame.evaluate(() => {
+        const range = document.createRange();
+        range.selectNodeContents(document.querySelector('p') as HTMLElement);
+        range.collapse(false);
+        const selection = window.getSelection() as Selection;
+        selection.removeAllRanges();
+        selection.addRange(range);
+      });
+      await page.keyboard.type('(追記)');
+      await settleAfterEdit();
+
+      await clickButton('HTML');
+      await page.waitForSelector('textarea[aria-label="HTML"]');
+      const source = await page.$eval('textarea[aria-label="HTML"]', (element) => (element as HTMLTextAreaElement).value);
+      expect(source).toBe(INDEX_HTML.replace('<p>本文</p>', '<p>本文(追記)</p>'));
+      expect(source).not.toContain('data:');
+      expect(source).not.toContain('blob:');
+    });
+
+    it('HTML・CSS・PDFを出力すると、CSSは<link>が指している位置(css/style.css)に保存され、PDFには画像が入り、HTML・CSSは取り込んだまま', async () => {
+      await importFolder(SITE);
+      const frame = await waitForPreviewFrame();
+      await imageLoadedIn(frame);
+      await outputTo('選んだフォルダへHTMLとCSSとPDFを出力');
+
+      expect(await listOpfsRoot()).toEqual(['css', 'index.html', 'index.pdf']);
+      expect(Buffer.from((await readOpfs('index.html')) ?? []).toString('utf8')).toBe(INDEX_HTML);
+      expect(Buffer.from((await readOpfs('css/style.css')) ?? []).toString('utf8')).toBe(SITE[1]?.text);
+      expect(pdfImageCount((await readOpfs('index.pdf')) ?? [])).toBeGreaterThan(0);
+      await shot('16-folder-html-output');
+    });
+
+    it('フォルダを実際にドラッグ&ドロップすると、下位のフォルダのCSS・画像まで読み込まれる(隠しフォルダ・node_modulesは読まない)', async () => {
+      const site = mkdtempSync(join(tmpdir(), 'md-pdf-editor-drop-'));
+      for (const directory of ['css', 'images', '.git', 'node_modules']) {
+        mkdirSync(join(site, directory));
+      }
+      writeFileSync(join(site, 'index.html'), INDEX_HTML);
+      writeFileSync(join(site, 'css/style.css'), 'h1 { color: rgb(204, 0, 0); }');
+      writeFileSync(join(site, 'images/a.png'), Buffer.from(PNG, 'base64'));
+      // 隠しフォルダ・node_modulesの中のHTMLは、候補に入らない(入れば、開くファイルの選択になる)
+      writeFileSync(join(site, '.git/other.html'), '<p>x</p>');
+      writeFileSync(join(site, 'node_modules/lib.html'), '<p>x</p>');
+
+      await page.goto(baseUrl);
+      await page.waitForSelector('.drop-zone');
+      const box = await (await page.$('.drop-zone'))?.boundingBox();
+      const client = await page.createCDPSession();
+      const data = { items: [], files: [site], dragOperationsMask: 1 };
+      for (const type of ['dragEnter', 'dragOver', 'drop'] as const) {
+        await client.send('Input.dispatchDragEvent', { type, x: (box?.x ?? 0) + (box?.width ?? 0) / 2, y: (box?.y ?? 0) + (box?.height ?? 0) / 2, data });
+      }
+      const frame = await waitForPreviewFrame();
+      await imageLoadedIn(frame);
+      expect(await frame.$eval('h1', (element) => getComputedStyle(element).color)).toBe('rgb(204, 0, 0)');
+      expect(await page.$$eval('.tab', (tabs) => tabs.map((tab) => tab.textContent))).toEqual(['プレビュー(直接編集)', 'HTML', 'CSS: css/style.css']);
+      rmSync(site, { recursive: true, force: true });
+    });
+
+    it('見つからない画像と外部の画像は、区別して警告する', async () => {
+      await importFolder([{ path: 'a.html', text: '<p>x</p><img src="images/none.png"><img src="https://example.com/a.png">' }]);
+      await waitForPreviewFrame();
+      const warnings = await page.$eval('.warning-list', (element) => (element as HTMLElement).innerText);
+      expect(warnings).toContain('見つからない画像');
+      expect(warnings).toContain('外部の画像');
+    });
+
+    it('ファイルを個別に選んだ場合は、HTMLの<img src="images/a.png">が、選んだ画像(a.png)にファイル名で対応する', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'md-pdf-editor-flat-'));
+      writeFileSync(join(dir, 'index.html'), '<!DOCTYPE html>\n<body>\n<img src="images/a.png">\n</body>\n');
+      writeFileSync(join(dir, 'a.png'), Buffer.from(PNG, 'base64'));
+      await page.goto(baseUrl);
+      await page.waitForSelector('input[type=file]', { hidden: true });
+      await ((await page.$('input[type=file]')) as ElementHandle<HTMLInputElement>).uploadFile(join(dir, 'index.html'), join(dir, 'a.png'));
+      const frame = await waitForPreviewFrame();
+      await imageLoadedIn(frame);
+      expect(await page.$('.warning-list')).toBeNull();
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('フォルダにMarkdownまたはHTMLが複数あるときは、開くファイルを選べる', async () => {
+      await importFolder([
+        { path: 'a.html', text: '<p>HTMLの文書</p>' },
+        { path: 'docs/b.md', text: '# Markdownの文書' },
+      ]);
+      await page.waitForSelector('.choose-list');
+      expect(await page.$$eval('.choose-list button', (buttons) => buttons.map((button) => button.textContent))).toEqual(['a.html', 'docs/b.md']);
+      await clickButton('docs/b.md');
+      await page.waitForSelector('.md-editor-content h1');
+      expect(await page.$$eval('.tab', (tabs) => tabs.map((tab) => tab.textContent))).toEqual(['プレビュー(書式付きで編集)', 'Markdown']);
+    });
+
+    it('MarkdownやHTMLが無いフォルダは、取り込まず理由を表示する', async () => {
+      await importFolder([{ path: 'images/a.png', base64: PNG }]);
+      await page.waitForSelector('[role="alert"]');
+      expect(await page.$eval('[role="alert"]', (element) => (element as HTMLElement).innerText)).toContain('見つかりません');
+    });
+
+    it('Markdownの画像(![図](img/a.png))を、フォルダ内の位置のとおりに、エディタに表示し、PDFにも入れる(Markdownの本文は変わらない)', async () => {
+      const markdown = '# 題\n\n![図](img/a.png)\n';
+      await importFolder([
+        { path: 'docs/guide.md', text: markdown },
+        { path: 'docs/img/a.png', base64: PNG },
+      ]);
+      await page.waitForSelector('.md-editor-content h1');
+      await page.waitForFunction(() => {
+        const image = document.querySelector('.md-editor-content img') as HTMLImageElement | null;
+        return image !== null && image.complete && image.naturalWidth > 0;
+      });
+      expect(await page.$('.warning-list')).toBeNull();
+
+      await page.click('.md-editor-content h1');
+      await page.keyboard.press('End');
+      await page.keyboard.type('改');
+      await clickButton('Markdown');
+      const edited = await sourceValue();
+      expect(edited).toContain('# 題改');
+      expect(edited).toContain('![図](img/a.png)');
+      expect(edited).not.toContain('data:');
+      expect(edited).not.toContain('blob:');
+
+      await outputTo('選んだフォルダへMDとPDFを出力');
+      expect(await listOpfsRoot()).toEqual(['guide.md', 'guide.pdf']);
+      expect(Buffer.from((await readOpfs('guide.md')) ?? []).toString('utf8')).toContain('![図](img/a.png)');
+      expect(pdfImageCount((await readOpfs('guide.pdf')) ?? [])).toBeGreaterThan(0);
+      await shot('17-folder-markdown');
+    });
+
+    it('Markdownの画像が見つからない場合は、警告する', async () => {
+      await importFolder([{ path: 'a.md', text: '![図](images/none.png)' }]);
+      await page.waitForSelector('.warning-list');
+      expect(await page.$eval('.warning-list', (element) => (element as HTMLElement).innerText)).toContain('表示できない画像');
+    });
+  });
   });
 
   it('「PDFを生成して確認」でPDFが新しいタブに開く', async () => {

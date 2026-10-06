@@ -13,7 +13,7 @@ services:
       # 認証機能が無いため、既定ではこのPCからのみ接続できる(変更は .env の BIND_ADDR)
       - "${BIND_ADDR:-127.0.0.1}:${HOST_PORT:-8088}:8080"
     environment:
-      MAX_MARKDOWN_BYTES: ${MAX_MARKDOWN_BYTES:-5242880}
+      MAX_MARKDOWN_BYTES: ${MAX_MARKDOWN_BYTES:-31457280}
       PDF_TIMEOUT_MS: ${PDF_TIMEOUT_MS:-60000}
     # Chromiumの共有メモリ(既定の64MBでは大きな文書で落ちる)
     shm_size: "1gb"

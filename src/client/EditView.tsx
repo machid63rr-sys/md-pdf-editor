@@ -1,7 +1,9 @@
 import React, { useCallback, useMemo, useState } from 'react';
 import type { MarkdownDocument } from './documents';
+import { isImagePath } from './assets';
 import { defaultBaseName } from './filename';
 import { lintMarkdown } from './lint';
+import { collectMarkdownAssets } from './markdownAssets';
 import type { OutputFile } from './outputMode';
 import OutputPanel from './OutputPanel';
 import { requestPdf } from './pdfClient';
@@ -37,7 +39,28 @@ const EditView: React.FC<EditViewProps> = ({ document, onClose }) => {
   const [mode, setMode] = useState<EditorMode>('rich');
   const [parseError, setParseError] = useState<string | null>(null);
 
-  const warnings = useMemo(() => lintMarkdown(markdown), [markdown]);
+  const { assets, baseDir } = document;
+  // 取り込んだ画像として表示できる参照か(相対パスの画像が、取り込んだファイルの中にあるか)
+  const canDisplayImage = useCallback(
+    (reference: string): boolean => {
+      const path = assets.resolve(reference, baseDir);
+      return path !== undefined && isImagePath(path);
+    },
+    [assets, baseDir],
+  );
+  // エディタ内の画像を、取り込んだファイルから表示する(画像の参照そのものは、Markdownのまま変わらない)
+  const resolveImage = useCallback(
+    async (source: string): Promise<string> => {
+      const path = assets.resolve(source, baseDir);
+      if (path === undefined) {
+        return source;
+      }
+      await assets.ensure([path]);
+      return assets.previewUrl(path) ?? source;
+    },
+    [assets, baseDir],
+  );
+  const warnings = useMemo(() => lintMarkdown(markdown, canDisplayImage), [markdown, canDisplayImage]);
   const outputFiles = useMemo(() => outputFilesOf(markdown), [markdown]);
 
   const handleParseError = useCallback((message: string) => {
@@ -120,6 +143,7 @@ const EditView: React.FC<EditViewProps> = ({ document, onClose }) => {
               initialMarkdown={editorSeed}
               onChange={setMarkdown}
               onParseError={handleParseError}
+              resolveImage={resolveImage}
             />
           ) : (
             <textarea
@@ -139,7 +163,9 @@ const EditView: React.FC<EditViewProps> = ({ document, onClose }) => {
         <OutputPanel
           files={outputFiles}
           defaultBaseName={defaultBaseName(document.sourceName)}
-          generatePdf={() => requestPdf({ kind: 'markdown', text: markdown })}
+          generatePdf={async () =>
+            requestPdf({ kind: 'markdown', text: markdown, baseDir, assets: await collectMarkdownAssets(markdown, baseDir, assets) })
+          }
           empty={markdown.trim() === ''}
         />
       </main>

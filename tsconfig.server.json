@@ -12,9 +12,9 @@
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
     "types": ["node"],
-    "rootDir": "src/server",
-    "outDir": "dist/server"
+    "rootDir": "src",
+    "outDir": "dist"
   },
-  "include": ["src/server"],
-  "exclude": ["src/server/**/*.test.ts"]
+  "include": ["src/server", "src/shared"],
+  "exclude": ["src/**/*.test.ts"]
 }

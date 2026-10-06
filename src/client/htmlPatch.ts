@@ -80,6 +80,11 @@ function sameNode(a: ChildNode, b: ChildNode): boolean {
     if (!sameShell(a, b)) {
       return false;
     }
+    // <style>・<script>の中身は、プレビュー用に書き換えられている(画像の埋め込みなど)ことがあり、
+    // プレビュー上で編集もできないため、比べない
+    if (a.tagName === 'style' || a.tagName === 'script') {
+      return true;
+    }
     const ac = childrenOf(a);
     const bc = childrenOf(b);
     return ac.length === bc.length && ac.every((child, index) => sameNode(child, bc[index] as ChildNode));

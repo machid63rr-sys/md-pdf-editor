@@ -1,7 +1,8 @@
 import React, { useRef, useState } from 'react';
-import { decodeUtf8Strict } from './decodeUtf8';
+import { AssetStore, type BundleFile } from './assets';
 import type { ImportedDocument } from './documents';
-import { classifyImport, type ReadFile } from './importFiles';
+import { importBundle } from './importFiles';
+import { collectDropped, fromDirectoryInput, type EntryLike } from './readFolder';
 
 interface ImportViewProps {
   onImport: (document: ImportedDocument) => void;
@@ -12,34 +13,60 @@ const messageOf = (cause: unknown): string => (cause instanceof Error ? cause.me
 type PasteKind = 'markdown' | 'html';
 const PASTE_LABEL: Readonly<Record<PasteKind, string>> = { markdown: 'Markdown', html: 'HTML' };
 
-// 取り込める文書は、MarkdownまたはHTML(HTMLにはCSSファイルを添えられる)
-const ACCEPT = '.md,.markdown,.mdown,.txt,.html,.htm,.css,text/markdown,text/plain,text/html,text/css';
+// 個別に選べるファイル。HTMLにはCSS・画像を、Markdownには画像を添えられる
+const ACCEPT = '.md,.markdown,.mdown,.txt,.html,.htm,.css,.png,.jpg,.jpeg,.gif,.webp,.svg,text/markdown,text/plain,text/html,text/css,image/*';
 
-/** 取り込み画面。ファイルの選択・ドラッグ&ドロップ(複数可)・貼り付けに対応する */
+// フォルダの中に文書が複数ある場合の、開くファイルの選択待ち
+interface Choosing {
+  readonly files: readonly BundleFile[];
+  readonly candidates: readonly string[];
+}
+
+// 「フォルダを選択」のための属性。標準の型定義に無いため、まとめて渡す
+const DIRECTORY_INPUT_ATTRIBUTES = { webkitdirectory: '' } as object;
+
+/** 取り込み画面。フォルダ・ファイルの選択、ドラッグ&ドロップ、貼り付けに対応する */
 const ImportView: React.FC<ImportViewProps> = ({ onImport }) => {
   const fileInput = useRef<HTMLInputElement>(null);
+  const folderInput = useRef<HTMLInputElement>(null);
   const [pasted, setPasted] = useState('');
   const [pasteKind, setPasteKind] = useState<PasteKind>('markdown');
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [choosing, setChoosing] = useState<Choosing | null>(null);
 
-  const importFiles = async (files: readonly File[]): Promise<void> => {
-    const read: ReadFile[] = [];
-    for (const file of files) {
-      try {
-        read.push({ name: file.name, text: decodeUtf8Strict(await file.arrayBuffer()) });
-      } catch (cause) {
-        setError(`「${file.name}」を読み込めませんでした。${messageOf(cause)}`);
-        return;
+  // structured: フォルダごと取り込んだ(フォルダ構成が分かる)場合 true
+  const runImport = async (files: readonly BundleFile[], structured: boolean, chosen?: string): Promise<void> => {
+    try {
+      const outcome = await importBundle(files, chosen === undefined ? { structured } : { structured, chosen });
+      if (outcome.kind === 'error') {
+        setChoosing(null);
+        setError(outcome.message);
+      } else if (outcome.kind === 'choose') {
+        setError(null);
+        setChoosing({ files, candidates: outcome.candidates });
+      } else {
+        setError(null);
+        setChoosing(null);
+        onImport(outcome.document);
       }
+    } catch (cause) {
+      setError(messageOf(cause));
     }
-    const result = classifyImport(read);
-    if (!result.ok) {
-      setError(result.message);
-      return;
+  };
+
+  const importFiles = (files: readonly File[]): Promise<void> =>
+    runImport(
+      files.map((file) => ({ path: file.name, file })),
+      false,
+    );
+
+  const importDroppedFolder = async (entries: readonly EntryLike[]): Promise<void> => {
+    try {
+      await runImport(await collectDropped(entries), true);
+    } catch (cause) {
+      setError(messageOf(cause));
     }
-    setError(null);
-    onImport(result.document);
   };
 
   const importPasted = (): void => {
@@ -48,10 +75,11 @@ const ImportView: React.FC<ImportViewProps> = ({ onImport }) => {
       return;
     }
     setError(null);
+    const common = { sourceName: null, baseDir: '', assets: new AssetStore([], false) };
     onImport(
       pasteKind === 'html'
-        ? { kind: 'html', html: pasted, stylesheets: [], sourceName: null }
-        : { kind: 'markdown', markdown: pasted, sourceName: null },
+        ? { kind: 'html', html: pasted, stylesheets: [], ...common }
+        : { kind: 'markdown', markdown: pasted, ...common },
     );
   };
 
@@ -71,16 +99,29 @@ const ImportView: React.FC<ImportViewProps> = ({ onImport }) => {
           onDrop={(event) => {
             event.preventDefault();
             setDragging(false);
+            // ドロップされたものは、イベントの処理が終わると読めなくなるため、ここですべて取り出しておく
+            const entries = [...event.dataTransfer.items].flatMap((item) => {
+              const entry = item.kind === 'file' ? item.webkitGetAsEntry() : null;
+              return entry === null ? [] : [entry];
+            });
             const files = [...event.dataTransfer.files];
-            if (files.length > 0) {
+            if (entries.some((entry) => entry.isDirectory)) {
+              void importDroppedFolder(entries);
+            } else if (files.length > 0) {
               void importFiles(files);
             }
           }}
         >
-          <p>Markdown(.md / .markdown / .txt)またはHTML(.html / .htm)のファイルを、ここへドラッグ&ドロップ</p>
-          <p className="drop-note">HTMLは、使っているCSSファイル(.css)も一緒に選ぶ(複数選択)と、見た目を反映して編集できます。</p>
-          <p>
-            <button type="button" className="button button-primary" onClick={() => fileInput.current?.click()}>
+          <p>Markdown(.md / .markdown / .txt)またはHTML(.html / .htm)の<strong>フォルダ</strong>、またはファイルを、ここへドラッグ&ドロップ</p>
+          <p className="drop-note">
+            フォルダごと取り込むと、HTML・Markdownから参照している画像やCSSを、フォルダ内の位置のとおりに自動で読み込みます。
+            ファイルを個別に選ぶ場合は、CSS・画像も一緒に複数選択してください(ファイル名で突き合わせます)。
+          </p>
+          <p className="drop-buttons">
+            <button type="button" className="button button-primary" onClick={() => folderInput.current?.click()}>
+              フォルダを選択
+            </button>
+            <button type="button" className="button" onClick={() => fileInput.current?.click()}>
               ファイルを選択
             </button>
           </p>
@@ -98,7 +139,42 @@ const ImportView: React.FC<ImportViewProps> = ({ onImport }) => {
               }
             }}
           />
+          <input
+            ref={folderInput}
+            type="file"
+            aria-label="フォルダを選択"
+            {...DIRECTORY_INPUT_ATTRIBUTES}
+            hidden
+            onChange={(event) => {
+              const picked = event.target.files;
+              try {
+                const files = picked === null ? [] : fromDirectoryInput(picked);
+                event.target.value = '';
+                if (files.length > 0) {
+                  void runImport(files, true);
+                }
+              } catch (cause) {
+                event.target.value = '';
+                setError(messageOf(cause));
+              }
+            }}
+          />
         </section>
+
+        {choosing !== null && (
+          <section className="choose-section" aria-label="開くファイルの選択">
+            <p>フォルダの中に、MarkdownまたはHTMLのファイルが{choosing.candidates.length}個あります。開くファイルを選んでください。</p>
+            <ul className="choose-list">
+              {choosing.candidates.map((path) => (
+                <li key={path}>
+                  <button type="button" className="button" onClick={() => void runImport(choosing.files, true, path)}>
+                    {path}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
 
         <section className="paste-section">
           <label htmlFor="paste-area">または、貼り付ける</label>

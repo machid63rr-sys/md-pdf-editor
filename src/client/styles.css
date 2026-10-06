@@ -369,3 +369,28 @@ body {
   border: 0;
   background: #fff;
 }
+
+/* 取り込み画面: フォルダ・ファイルの選択ボタン、複数の文書から開くファイルの選択 */
+.drop-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+.choose-section {
+  padding: 12px 16px;
+  border: 1px solid var(--info-border);
+  border-radius: 8px;
+  background: var(--info-bg);
+}
+.choose-section p {
+  margin: 0 0 8px;
+}
+.choose-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}

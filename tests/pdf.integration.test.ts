@@ -76,6 +76,15 @@ describe('PDF生成(実Chromium)', () => {
     expect(text).toMatch(/1\s*\/\s*1/);
   });
 
+  it('Markdownの相対パスの画像(assets)は、PDFに画像として入る。渡されていない画像は文字になる', async () => {
+    const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    const markdown = '# 画像\n\n![図](img/a.png)\n\n![無い図](img/none.png)';
+    const path = writePdf('md-assets.pdf', await renderer.render(buildDocumentHtml(markdown, css, { baseDir: 'docs', files: { 'docs/img/a.png': png } })));
+
+    expect(poppler('pdfimages', '-list', path).split('\n').filter((line) => /^\s*\d+\s+\d+\s+image\b/.test(line))).toHaveLength(1);
+    expect(poppler('pdftotext', path, '-')).toContain('[画像: 無い図](img/none.png)');
+  });
+
   it('長い文書は複数ページになり、表の見出し行が各ページで繰り返される', async () => {
     const rows = Array.from({ length: 120 }, (_, i) => `| ${i + 1} | データ${i + 1} |`).join('\n');
     const markdown = `# 長い表\n\n| 番号 | 内容 |\n| --- | --- |\n${rows}`;
