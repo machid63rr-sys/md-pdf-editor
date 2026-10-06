@@ -11,6 +11,7 @@ import OutputPanel from './OutputPanel';
 import { requestPdf } from './pdfClient';
 import RichMarkdownEditor from './RichMarkdownEditor';
 import SourceArea from './SourceArea';
+import { usePageLayout } from './usePageLayout';
 import WarningList from './WarningList';
 
 interface EditViewProps {
@@ -66,6 +67,8 @@ const EditView: React.FC<EditViewProps> = ({ document, onClose }) => {
     [assets, baseDir],
   );
   const warnings = useMemo(() => lintMarkdown(markdown, canDisplayImage), [markdown, canDisplayImage]);
+  // PDFのページの区切り位置(「プレビュー」で、書式付きの表示に重ねる)。測れない(解釈エラー)ときや、Markdownタブでは、測らない
+  const pageLayout = usePageLayout(markdown, mode === 'rich' && parseError === null, baseDir, assets);
   const outputFiles = useMemo(() => outputFilesOf(markdown), [markdown]);
 
   const handleParseError = useCallback((message: string) => {
@@ -151,6 +154,8 @@ const EditView: React.FC<EditViewProps> = ({ document, onClose }) => {
               onParseError={handleParseError}
               resolveImage={resolveImage}
               onEmbedNotice={setEmbedNotice}
+              pageLayout={pageLayout}
+              markdown={markdown}
             />
           ) : (
             <SourceArea value={markdown} onChange={setMarkdown} ariaLabel="Markdown" snippet="markdown" onNotice={setEmbedNotice} />
@@ -160,7 +165,7 @@ const EditView: React.FC<EditViewProps> = ({ document, onClose }) => {
         <p className="hint">
           画像ファイル(PNG・JPEG・GIF・WebP・SVG。1枚10MBまで)をドラッグ&ドロップすると、カーソルの位置に、画像のデータを埋め込みます(Markdownの中に、画像のデータが文字として入るため、文書が大きくなります)。
           「プレビュー」で一度でも編集すると、Markdown全体の書き方が正規化されます(箇条書きの記号、表の桁揃えなど。内容は保たれます)。
-          PDFはサーバ側のフォントで描画されるため、プレビューと字形や改ページ位置が少し異なることがあります。
+          PDFはサーバ側のフォントで描画されるため、プレビューと字形や折り返しが少し異なることがあります(ページの区切りは、PDFと同じ条件で測った位置を、赤い点線で表示しています)。
         </p>
 
         <OutputPanel

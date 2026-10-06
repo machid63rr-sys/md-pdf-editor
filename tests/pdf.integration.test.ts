@@ -242,6 +242,284 @@ describe('Markdownの中の<img>タグ(エディタで大きさを変えた画�
   });
 });
 
+describe('ページの区切りの測定(実Chromium)', () => {
+  const para = (label: string, repeat = 8): string => `これは${label}です。` + 'PDFのページの区切りを確かめるための、少し長めの文章を繰り返します。'.repeat(repeat);
+
+  const longDocument = (): string => {
+    const parts: string[] = ['# 長い文書', ''];
+    for (let chapter = 1; chapter <= 7; chapter += 1) {
+      parts.push(`## 第${chapter}章 見出し`, '');
+      parts.push(para(`第${chapter}章の段落A`), '', para(`第${chapter}章の段落B`, 5), '');
+      parts.push(...Array.from({ length: 5 }, (_, index) => `- 第${chapter}章の項目${index + 1} ${'説明の文章'.repeat(6)}`), '');
+      parts.push(`> 第${chapter}章の引用です。${'引用の文章'.repeat(10)}`, '');
+      if (chapter === 3) {
+        parts.push('| 番号 | 名前 | 説明 |', '| --- | --- | --- |', ...Array.from({ length: 45 }, (_, index) => `| ${index + 1} | 行${index + 1}の名前 | 行${index + 1}の説明文です |`), '');
+      }
+      if (chapter === 5) {
+        parts.push('```', ...Array.from({ length: 45 }, (_, index) => `code line ${index + 1}`), '```', '');
+      }
+    }
+    return parts.join('\n');
+  };
+
+  const pagesOf = (path: string): number => Number(/Pages:\s+(\d+)/.exec(poppler('pdfinfo', path))?.[1]);
+  // ページの本文(フッターのページ番号を除く)。空白は除く
+  const textOfPage = (path: string, page: number): string =>
+    poppler('pdftotext', '-raw', '-f', String(page), '-l', String(page), path, '-').replace(/\s+/g, '');
+
+  it('測ったページ数と、各ページの最初の文字が、実際のPDFと一致する(段落・リスト・引用・表・コードを含む長い文書)', async () => {
+    const layout = await renderer.measurePages(buildDocumentHtml(longDocument(), css, undefined, undefined, { tagBlocks: true }));
+    const path = writePdf('layout-long.pdf', await renderer.render(buildDocumentHtml(longDocument(), css)));
+
+    expect(layout.pages).toBeGreaterThan(5);
+    expect(layout.pages).toBe(pagesOf(path));
+    expect(layout.starts.map((start) => start.page)).toEqual(Array.from({ length: layout.pages - 1 }, (_, index) => index + 2));
+    for (const start of layout.starts) {
+      const text = textOfPage(path, start.page);
+      // そのページの最初に、新しいページの最初の文字がある(表は、見出しの行が繰り返される分だけ、後ろにずれる)
+      const at = text.indexOf(start.snippet.slice(0, 10));
+      expect(at, `ページ${start.page} 「${start.snippet}」 実際: ${text.slice(0, 40)}`).toBeGreaterThanOrEqual(0);
+      expect(at, `ページ${start.page}`).toBeLessThanOrEqual(start.kind === 'row' ? 20 : 3);
+    }
+  });
+
+  it('位置の種類: 段落の途中(text)・表の行(row)・コードの行(line)・ブロックの先頭(start)が、それぞれ現れる', async () => {
+    const markdown = longDocument();
+    const layout = await renderer.measurePages(buildDocumentHtml(markdown, css, undefined, undefined, { tagBlocks: true }));
+    const kinds = new Set(layout.starts.map((start) => start.kind));
+    for (const kind of ['text', 'start', 'row', 'line']) {
+      expect(kinds.has(kind as 'text'), kind).toBe(true);
+    }
+    // ブロックの番号は、Markdownの最上位のブロックの並び(空行で区切られた、見出し・段落・リスト・表・コードなど)の番号
+    const blockCount = markdown.split(/\n{2,}/).length - 1; // コードブロックの中に空行は無い
+    for (const start of layout.starts) {
+      expect(start.block).toBeGreaterThanOrEqual(0);
+      expect(start.block).toBeLessThanOrEqual(blockCount);
+      if (start.kind === 'row') {
+        expect(start.tag).toBe('table');
+        expect(start.index).toBeGreaterThan(0);
+      }
+      if (start.kind === 'line') {
+        expect(start.tag).toBe('pre');
+        expect(start.index).toBeGreaterThan(0);
+      }
+    }
+    // 番号は、後ろのページほど大きい(ページは、文書の順に並ぶ)
+    const blocks = layout.starts.map((start) => start.block);
+    expect(blocks).toEqual([...blocks].sort((a, b) => a - b));
+  });
+
+  it('見出しは、ページの最後に1つだけ残らず、次のブロックと一緒に、次のページに移る(PDFと同じ)', async () => {
+    // 見出しの直前までを、ちょうどページの最後に近づける: 段落の数を変えて、複数の文書で、PDFとの一致を確かめる
+    for (const paragraphs of [9, 10, 11, 12, 13, 14, 15, 16]) {
+      const markdown = [`# 見出し0`, ...Array.from({ length: paragraphs }, (_, index) => para(`段落${index}`, 4)), '## 次の見出し', para('見出しの後の段落', 4)].join('\n\n');
+      const html = buildDocumentHtml(markdown, css);
+      const layout = await renderer.measurePages(html);
+      const path = writePdf(`layout-heading-${paragraphs}.pdf`, await renderer.render(html));
+      expect(layout.pages, `段落${paragraphs}`).toBe(pagesOf(path));
+      for (const start of layout.starts) {
+        expect(textOfPage(path, start.page).indexOf(start.snippet.slice(0, 10)), `段落${paragraphs} ページ${start.page}`).toBe(0);
+      }
+    }
+  });
+
+  it('1ページに収まる文書は、1ページで、区切りは無い。空に近い文書も扱える', async () => {
+    const short = await renderer.measurePages(buildDocumentHtml('# 短い文書\n\n本文です。', css));
+    expect(short).toEqual({ pages: 1, starts: [] });
+    const empty = await renderer.measurePages(buildDocumentHtml('', css));
+    expect(empty.pages).toBe(1);
+    expect(empty.starts).toEqual([]);
+  });
+
+  it('画像・水平線が、ページの先頭になる場合も、PDFと一致する', async () => {
+    const red = solidPng(400, 300, [200, 30, 30]);
+    const filler = (count: number): string => Array.from({ length: count }, (_, index) => para(`詰め物${index}`, 3)).join('\n\n');
+    for (const count of [6, 7, 8, 9, 10, 11]) {
+      const markdown = [filler(count), `![](${red})`, '---', 'この水平線のあとの文です。'].join('\n\n');
+      const html = buildDocumentHtml(markdown, css);
+      const layout = await renderer.measurePages(html);
+      const path = writePdf(`layout-image-${count}.pdf`, await renderer.render(html));
+      expect(layout.pages, `詰め物${count}`).toBe(pagesOf(path));
+      for (const start of layout.starts.filter((entry) => entry.snippet !== '')) {
+        expect(textOfPage(path, start.page).indexOf(start.snippet.slice(0, 10)), `詰め物${count} ページ${start.page}`).toBeGreaterThanOrEqual(0);
+      }
+    }
+  });
+
+  // 乱数(再現できるよう、種を決める)で作った、ブロックの種類・長さの違う文書で、PDFとの一致を確かめる
+  it('いろいろな文書(段落・見出し・リスト・表・コード・引用・水平線・画像を、さまざまな長さで組み合わせたもの)でも、PDFのページ数と各ページの最初が一致する', async () => {
+    let seed = 20261006;
+    const random = (): number => {
+      seed = (seed * 1664525 + 1013904223) % 4294967296;
+      return seed / 4294967296;
+    };
+    const between = (min: number, max: number): number => min + Math.floor(random() * (max - min + 1));
+    const image = solidPng(300, 120, [30, 90, 200]);
+    const block = (index: number): string => {
+      switch (between(0, 8)) {
+        case 0:
+          return `${'#'.repeat(between(1, 3))} 見出し${index}`;
+        case 1:
+        case 2:
+          return para(`段落${index}`, between(1, 9));
+        case 3:
+          return Array.from({ length: between(2, 9) }, (_, item) => `- 項目${index}-${item} ${'説明の文章'.repeat(between(1, 8))}`).join('\n');
+        case 4:
+          return ['| 番号 | 内容 |', '| --- | --- |', ...Array.from({ length: between(2, 25) }, (_, row) => `| ${row} | 行${index}-${row}の説明文 |`)].join('\n');
+        case 5:
+          return ['```', ...Array.from({ length: between(2, 30) }, (_, line) => `code ${index} line ${line}`), '```'].join('\n');
+        case 6:
+          return `> 引用${index}です。${'引用の文章'.repeat(between(2, 25))}`;
+        case 7:
+          return random() < 0.5 ? '---' : `![](${image})`;
+        default:
+          return `1. 番号付き${index}-a ${'説明'.repeat(between(1, 20))}\n2. 番号付き${index}-b ${'説明'.repeat(between(1, 20))}`;
+      }
+    };
+    for (let documentIndex = 0; documentIndex < 12; documentIndex += 1) {
+      const markdown = Array.from({ length: between(8, 28) }, (_, index) => block(index)).join('\n\n');
+      const layout = await renderer.measurePages(buildDocumentHtml(markdown, css, undefined, undefined, { tagBlocks: true }));
+      const path = writePdf(`layout-fuzz-${documentIndex}.pdf`, await renderer.render(buildDocumentHtml(markdown, css)));
+      expect(layout.pages, `文書${documentIndex}のページ数`).toBe(pagesOf(path));
+      for (const start of layout.starts.filter((entry) => entry.snippet !== '')) {
+        const text = textOfPage(path, start.page);
+        // 先頭の数文字だけ比べる(リストの番号「1.」など、PDFの文字には含まれるが、文書の文字には無い記号が、途中に入るため)
+        const at = text.indexOf(start.snippet.slice(0, 4));
+        expect(at, `文書${documentIndex} ページ${start.page} 「${start.snippet}」 実際: ${text.slice(0, 30)}`).toBeGreaterThanOrEqual(0);
+        expect(at, `文書${documentIndex} ページ${start.page}`).toBeLessThanOrEqual(start.kind === 'row' ? 20 : 3);
+      }
+    }
+  });
+
+  it('測定のために、文書のスクリプトは実行されず、外部へも通信しない', async () => {
+    const requested: string[] = [];
+    const probe: Server = createServer((req, res) => {
+      requested.push(req.url ?? '');
+      res.end();
+    });
+    await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', resolve));
+    const { port } = probe.address() as AddressInfo;
+    try {
+      // buildDocumentHtmlは、生HTMLを文字にするため、レンダラ自身の遮断を見るよう、生のHTMLを渡す
+      const html = `<!doctype html><html><body class="document"><p id="t">本文</p><img src="http://127.0.0.1:${port}/x.png"><script>document.getElementById('t').textContent='実行された';fetch('http://127.0.0.1:${port}/s')</script></body></html>`;
+      const layout = await renderer.measurePages(html);
+      expect(layout.pages).toBe(1);
+      expect(requested).toEqual([]);
+    } finally {
+      await new Promise<void>((resolve, reject) => probe.close((error) => (error ? reject(error) : resolve())));
+    }
+  });
+});
+
+describe('空行(「&nbsp;」だけの段落)のPDF(実Chromium)', () => {
+  // PDFの中の単語の、上端の位置(pt)
+  const yOf = (path: string, word: string): number => {
+    const xml = poppler('pdftotext', '-bbox', path, '-');
+    const match = new RegExp(`yMin="([\\d.]+)"[^>]*>${word}</word>`).exec(xml);
+    if (match === null) {
+      throw new Error(`PDFに「${word}」がありません`);
+    }
+    return Number(match[1]);
+  };
+
+  const gapOf = async (markdown: string, name: string): Promise<number> => {
+    const path = writePdf(`${name}.pdf`, await renderer.render(buildDocumentHtml(markdown, css)));
+    return yOf(path, '次の段落') - yOf(path, '最初の段落');
+  };
+
+  it('「&nbsp;」だけの段落の数だけ、段落の間が空く。空行が重なっただけでは、空かない(Markdownの規則)', async () => {
+    const plain = await gapOf('最初の段落\n\n次の段落', 'blank-0');
+    const one = await gapOf('最初の段落\n\n&nbsp;\n\n次の段落', 'blank-1');
+    const two = await gapOf('最初の段落\n\n&nbsp;\n\n&nbsp;\n\n次の段落', 'blank-2');
+    const collapsed = await gapOf('最初の段落\n\n\n\n\n\n次の段落', 'blank-collapsed');
+
+    // 1つにつき、1行分(行の高さ 11pt×1.7 = 18.7pt)と、段落の間隔(0.6em = 6.6pt)の、約25pt
+    expect(one - plain).toBeGreaterThan(22);
+    expect(one - plain).toBeLessThan(28);
+    expect(two - one).toBeGreaterThan(22);
+    expect(two - one).toBeLessThan(28);
+    // 空行が重なっただけでは、空かない
+    expect(collapsed).toBeCloseTo(plain, 0);
+  });
+
+  it('文書の先頭の「&nbsp;」の段落は、先頭に空きになる', async () => {
+    const withBlank = writePdf('blank-top.pdf', await renderer.render(buildDocumentHtml('&nbsp;\n\n最初の段落', css)));
+    const without = writePdf('blank-top-none.pdf', await renderer.render(buildDocumentHtml('最初の段落', css)));
+    expect(yOf(withBlank, '最初の段落') - yOf(without, '最初の段落')).toBeGreaterThan(22);
+  });
+
+  describe('ページの区切りの測定: 空行の途中でページが替わる場合', () => {
+    const MARKER = '境目のあとの段落';
+    // 空行1つ分の高さ(行 11pt×1.7 = 18.7pt + 段落の間隔 6.6pt)
+    const BLANK_PITCH_PT = 25.3;
+    const pagesOf = (path: string): number => Number(/Pages:\s+(\d+)/.exec(poppler('pdfinfo', path))?.[1]);
+    const filler = (count: number): string[] =>
+      Array.from({ length: count }, (_, index) => `詰め物${index}の段落です。` + 'ページの区切りを確かめるための文章です。'.repeat(8));
+
+    // 各ページの、最初の単語と、MARKER(1行だけの段落)が現れるページ・上端(pt)
+    const wordsOf = (path: string, page: number): string => poppler('pdftotext', '-bbox', '-f', String(page), '-l', String(page), path, '-');
+    const topOfPage = (path: string, page: number): number => Number(/yMin="([\d.]+)"/.exec(wordsOf(path, page))?.[1]);
+    const positionOf = (path: string, pages: number): { page: number; y: number } => {
+      for (let page = 1; page <= pages; page += 1) {
+        const match = new RegExp(`yMin="([\\d.]+)"[^>]*>${MARKER}</word>`).exec(wordsOf(path, page));
+        if (match !== null) {
+          return { page, y: Number(match[1]) };
+        }
+      }
+      throw new Error(`PDFに「${MARKER}」がありません`);
+    };
+
+    it('ページの上端に残る空行がある場合、区切りは、その空行の前になる(次の文字の前ではない。空行の数は、PDFと一致する)', async () => {
+      // 文字だけのページの先頭の高さ(基準)と、空行1つ分の高さ
+      const plainPath = writePdf('blank-span-plain.pdf', await renderer.render(buildDocumentHtml(filler(14).join('\n\n'), css)));
+      const base = topOfPage(plainPath, 2);
+
+      let spanning = 0;
+      for (const fillerCount of [7, 8]) {
+        for (const blanks of [0, 1, 2, 3, 4, 6, 8, 12]) {
+          const markdown = [...filler(fillerCount), ...Array.from({ length: blanks }, () => '&nbsp;'), MARKER].join('\n\n');
+          const label = `詰め物${fillerCount}・空行${blanks}`;
+          const layout = await renderer.measurePages(buildDocumentHtml(markdown, css, undefined, undefined, { tagBlocks: true }));
+          const path = writePdf(`blank-span-${fillerCount}-${blanks}.pdf`, await renderer.render(buildDocumentHtml(markdown, css)));
+          expect(layout.pages, label).toBe(pagesOf(path));
+
+          const found = positionOf(path, layout.pages);
+          if (found.page < 2) {
+            continue;
+          }
+          const start = layout.starts.find((entry) => entry.page === found.page);
+          expect(start, `${label}: ${found.page}ページ目の区切り`).toBeDefined();
+          const markerBlock = fillerCount + blanks;
+          if ((start?.block ?? 0) < fillerCount) {
+            continue; // 詰め物の文章の途中で、ページが替わる場合(空行とは関係が無い)
+          }
+          // そのページの上端に、いくつの空行が残っているか(PDFでの、MARKERの位置から)
+          const onPage = Math.round((found.y - base) / BLANK_PITCH_PT);
+          expect(markerBlock - (start?.block ?? 0), `${label}: ページ${found.page}の上端の空行の数(PDF ${onPage})`).toBe(onPage);
+          if (onPage > 0) {
+            // 空行から始まるページの区切りは、文字を持たない段落(snippetは空)の前になる
+            expect(start?.kind, label).toBe('start');
+            expect(start?.tag, label).toBe('p');
+            expect(start?.snippet, label).toBe('');
+            spanning += 1;
+          }
+        }
+      }
+      // 空行の途中でページが替わる場合が、実際に含まれている
+      expect(spanning).toBeGreaterThanOrEqual(6);
+    });
+
+    it('空行だけで、ページが埋まる場合も、ページ数と、各ページの先頭の位置が、PDFと一致する', async () => {
+      const markdown = [...filler(2), ...Array.from({ length: 70 }, () => '&nbsp;'), MARKER].join('\n\n');
+      const layout = await renderer.measurePages(buildDocumentHtml(markdown, css, undefined, undefined, { tagBlocks: true }));
+      const path = writePdf('blank-span-pages.pdf', await renderer.render(buildDocumentHtml(markdown, css)));
+      expect(layout.pages).toBeGreaterThanOrEqual(3);
+      expect(layout.pages).toBe(pagesOf(path));
+      expect(layout.starts.map((start) => start.page)).toEqual(Array.from({ length: layout.pages - 1 }, (_, index) => index + 2));
+    });
+  });
+});
+
 describe('コードの色分け(実Chromium)', () => {
   // キーワードの色(#c22b3d)に近い、赤い点。見出し・本文・背景(灰色)・コードの文字色(黒に近い)には現れない色
   const isKeywordRed = (r: number, g: number, b: number): boolean => r > 150 && g < 100 && b < 110;
@@ -492,6 +770,7 @@ describe('起動時セルフチェック', () => {
       chromiumVersion: () => Promise.resolve('x'),
       render: () => Promise.resolve(Buffer.from('not a pdf')),
       drawDiagrams: () => Promise.resolve([]),
+      measurePages: () => Promise.resolve({ pages: 1, blocks: [], starts: [] }),
     };
     await expect(selfCheck(broken, css)).rejects.toThrowError('生成物がPDFではありません');
   });
@@ -501,6 +780,7 @@ describe('起動時セルフチェック', () => {
       chromiumVersion: () => Promise.resolve('x'),
       render: () => Promise.resolve(Buffer.from('%PDF-1.7')),
       drawDiagrams: () => Promise.resolve([{ ok: false, message: 'Mermaidが読み込めません' }]),
+      measurePages: () => Promise.resolve({ pages: 1, blocks: [], starts: [] }),
     };
     await expect(selfCheck(broken, css)).rejects.toThrowError('Mermaidの図を描画できません (Mermaidが読み込めません)');
   });

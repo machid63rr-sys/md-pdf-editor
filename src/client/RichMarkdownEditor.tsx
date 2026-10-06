@@ -24,10 +24,15 @@ import {
 } from '@mdxeditor/editor';
 import '@mdxeditor/editor/style.css';
 import { isMermaidLanguage } from '../shared/mermaid';
+import { blankParagraphPlugin } from './blankParagraphPlugin';
+import { lineBreakPlugin } from './lineBreakPlugin';
+import { blankParagraphsToNbsp } from './blankLines';
 import { rangeAtPoint } from './dropPoint';
 import { embedProblemOf, readImages, summarize, type EmbedNotice } from './embedImage';
 import { escapeForMdx, unescapeFromMdx } from './mdxEscape';
 import MermaidBlockEditor from './MermaidBlockEditor';
+import PageBreakOverlay from './PageBreakOverlay';
+import type { PageLayoutState } from './usePageLayout';
 
 interface RichMarkdownEditorProps {
   // 編集モードに入った時点のMarkdown(以降の変更は内部で保持し、onChangeで親へ通知する)
@@ -39,6 +44,10 @@ interface RichMarkdownEditorProps {
   resolveImage: (source: string) => Promise<string>;
   // 画像ファイルのドロップ・貼り付けによる埋め込みの結果(成功・失敗)を知らせる
   onEmbedNotice: (notice: EmbedNotice | null) => void;
+  // PDFのページの区切り位置(サーバが測った結果)。プレビューの上に、線で重ねて表示する
+  pageLayout: PageLayoutState;
+  // いまのMarkdown(測定した内容と違えば、区切りの位置は、測り直すまで、古い)
+  markdown: string;
 }
 
 // 一覧に無い言語のコードブロックも、解釈エラーにならず通常どおり扱われる(実測済み)
@@ -77,11 +86,14 @@ const CODE_BLOCK_LANGUAGES = {
  *   利用者が触っていない本文が、取り込んだMarkdownから勝手に書き換わるのを避けるため。
  * - 解釈できない記法(脚注・参照形式のリンクなど)があると onParseError で通知する
  * - 取り込んだ画像(相対パスの画像)は、resolveImage で表示用のURLにして表示する
+ * - Enterで作った空の段落(空行)は、「&nbsp;」だけの段落として保存し、読み込むときに、空の段落に戻す(blankLines.ts)
  * - 画像ファイル(PNG・JPEG・GIF・WebP・SVG)をドロップ・貼り付けすると、data: URI として、文書に埋め込む
+ * - PDFのページの区切りを、線で重ねて、常に表示する(位置は、サーバがPDFと同じ条件で測ったもの。PageBreakOverlay)
  * - コードブロックは、言語ごとに色分けして表示する(言語は、ブロックの右上で選べる)。
  *   Mermaidのコードブロックは、コードの下に図も表示する
  */
-const RichMarkdownEditor: React.FC<RichMarkdownEditorProps> = ({ initialMarkdown, onChange, onParseError, resolveImage, onEmbedNotice }) => {
+const RichMarkdownEditor: React.FC<RichMarkdownEditorProps> = ({ initialMarkdown, onChange, onParseError, resolveImage, onEmbedNotice, pageLayout, markdown }) => {
+  const wrapper = useRef<HTMLDivElement>(null);
   // プラグインは、エディタを作るときに一度だけ渡すため、最新の通知先は、refを通して使う
   const notify = useRef(onEmbedNotice);
   notify.current = onEmbedNotice;
@@ -128,6 +140,7 @@ const RichMarkdownEditor: React.FC<RichMarkdownEditorProps> = ({ initialMarkdown
 
   return (
     <div
+      ref={wrapper}
       className="md-editor-drop"
       onDragOverCapture={(event) => {
         if (event.dataTransfer.types.includes('Files')) {
@@ -154,11 +167,13 @@ const RichMarkdownEditor: React.FC<RichMarkdownEditorProps> = ({ initialMarkdown
         markdown={escapeForMdx(initialMarkdown)}
         onChange={(markdown, initialMarkdownNormalize) => {
           if (!initialMarkdownNormalize) {
-            onChange(unescapeFromMdx(markdown));
+            onChange(blankParagraphsToNbsp(unescapeFromMdx(markdown)));
           }
         }}
         onError={({ error }) => onParseError(error)}
         plugins={[
+          blankParagraphPlugin(),
+          lineBreakPlugin(),
           headingsPlugin(),
           listsPlugin(),
           quotePlugin(),
@@ -191,6 +206,7 @@ const RichMarkdownEditor: React.FC<RichMarkdownEditorProps> = ({ initialMarkdown
           }),
         ]}
       />
+      <PageBreakOverlay container={wrapper} state={pageLayout} markdown={markdown} />
     </div>
   );
 };

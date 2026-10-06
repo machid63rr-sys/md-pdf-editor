@@ -161,6 +161,87 @@ describe('renderMarkdown', () => {
   });
 });
 
+describe('空行(「&nbsp;」だけの段落)', () => {
+  it('「&nbsp;」だけの段落は、空白の段落(1行分の空き)として出力される', () => {
+    const html = renderMarkdown('A\n\n&nbsp;\n\nB').bodyHtml;
+    expect(html).toBe('<p>A</p>\n<p>\u00a0</p>\n<p>B</p>');
+  });
+
+  it('「&nbsp;」の段落の数だけ、空白の段落が並ぶ(重なった空行は、1つの区切りにまとまる)', () => {
+    expect(renderMarkdown('A\n\n&nbsp;\n\n&nbsp;\n\nB').bodyHtml.match(/<p>\u00a0<\/p>/g)).toHaveLength(2);
+    expect(renderMarkdown('A\n\n\n\n\n\nB').bodyHtml).toBe('<p>A</p>\n<p>B</p>');
+  });
+
+  it('文書の先頭・末尾の「&nbsp;」の段落も、空白の段落になる', () => {
+    expect(renderMarkdown('&nbsp;\n\nA\n\n&nbsp;').bodyHtml).toBe('<p>\u00a0</p>\n<p>A</p>\n<p>\u00a0</p>');
+  });
+
+  it('ブロック番号(測定用)も、空白の段落に付く', () => {
+    const html = renderMarkdown('A\n\n&nbsp;\n\nB', undefined, undefined, { tagBlocks: true }).bodyHtml;
+    expect(html).toContain('<p data-block="1">\u00a0</p>');
+    expect(html).toContain('<p data-block="2">B</p>');
+  });
+});
+
+describe('ブロックの番号(ページの区切りの測定用)', () => {
+  const tagged = (markdown: string, diagrams?: DiagramMap): string => renderMarkdown(markdown, undefined, diagrams, { tagBlocks: true }).bodyHtml;
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 80"><g></g></svg>';
+  const flow = 'graph TD\n  A --> B';
+
+  it('付けなければ(PDFの文書)、属性は付かない', () => {
+    expect(renderMarkdown('# 見出し\n\n本文').bodyHtml).not.toContain('data-block');
+    expect(renderMarkdown('# 見出し\n\n本文', undefined, undefined, { tagBlocks: false }).bodyHtml).not.toContain('data-block');
+  });
+
+  it('最上位のブロック(見出し・段落・リスト・引用・表・コード・水平線)に、Markdownでの番号を付ける', () => {
+    const html = tagged(['# 見出し', '', '段落', '', '- 項目', '', '> 引用', '', '| a |', '| - |', '| 1 |', '', '```', 'code', '```', '', '---'].join('\n'));
+    for (const [tag, index] of [['h1', 0], ['p', 1], ['ul', 2], ['blockquote', 3], ['table', 4], ['pre', 5], ['hr', 6]] as const) {
+      expect(html, tag).toContain(`<${tag} data-block="${index}">`);
+    }
+  });
+
+  it('入れ子の要素(リストの項目・表のセル)には、付かない', () => {
+    const html = tagged('- a\n- b\n\n| x |\n| - |\n| y |');
+    expect(html.match(/data-block/g)).toHaveLength(2);
+    expect(html).toContain('<li>a</li>');
+  });
+
+  it('front matter・生HTMLのブロックも、1つのブロックとして数える', () => {
+    const html = tagged('---\ntitle: T\n---\n\n<div>生HTML</div>\n\n本文');
+    expect(html).toContain('<pre data-block="0">');
+    expect(html).toContain('<p data-block="1">');
+    expect(html).toContain('<p data-block="2">本文</p>');
+  });
+
+  it('画像だけの行(<img>のタグを含む)も、1つのブロック', () => {
+    const html = tagged('<img src="data:image/png;base64,iVBORw==" width="10">\n\n本文');
+    expect(html).toMatch(/<p data-block="0"><img /);
+    expect(html).toContain('<p data-block="1">本文</p>');
+  });
+
+  it('Mermaidの図: 1つのブロックが複数の要素になっても、同じ番号が付き、後ろのブロックの番号はずれない', () => {
+    const block = (meta: string): string => '```mermaid' + meta + '\n' + flow + '\n```';
+    const diagrams: DiagramMap = new Map([[flow, { ok: true, svg }]]);
+    // 図のみ: figure 1つ
+    expect(tagged(`前\n\n${block('')}\n\n後`, diagrams)).toMatch(/<p data-block="0">前<\/p>\n<figure[^>]* data-block="1"[^>]*>.*<p data-block="2">後<\/p>/s);
+    // コードと図: pre と figure の両方が、同じ番号
+    const both = tagged(`前\n\n${block(' show=both')}\n\n後`, diagrams);
+    expect(both).toContain('<pre data-block="1">');
+    expect(both).toMatch(/<figure[^>]* data-block="1"/);
+    expect(both).toContain('<p data-block="2">後</p>');
+    // 描けなかった図: 理由の段落とコードが、同じ番号
+    const failed = tagged(`前\n\n${block('')}\n\n後`, new Map([[flow, { ok: false, message: '誤り' }]]));
+    expect(failed).toMatch(/<p[^>]* data-block="1"[^>]*>Mermaid/);
+    expect(failed).toContain('<pre data-block="1">');
+    expect(failed).toContain('<p data-block="2">後</p>');
+  });
+
+  it('番号を付けても、見た目に関わるもの(タグ・クラス・中身)は変わらない', () => {
+    const markdown = '# 見出し\n\n```python\nprint(1)\n```\n\n| a |\n| - |\n| 1 |';
+    expect(tagged(markdown).replace(/ data-block="\d+"/g, '')).toBe(renderMarkdown(markdown).bodyHtml);
+  });
+});
+
 describe('Markdownの中の<img>タグ(エディタで大きさを変えた画像)', () => {
   const dataUri = 'data:image/png;base64,iVBORw==';
   const assets: MarkdownAssets = { baseDir: 'docs', files: { 'docs/img/a.png': dataUri } };

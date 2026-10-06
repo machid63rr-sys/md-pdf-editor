@@ -1,5 +1,7 @@
 import puppeteer, { type Browser, type Page } from 'puppeteer-core';
 import { MERMAID_CONFIG, diagramErrorMessage, type DiagramOutcome } from '../shared/mermaid.js';
+import { CONTENT_HEIGHT_PX, CONTENT_WIDTH_PX, PAGE, type PageLayout } from '../shared/pageLayout.js';
+import { MEASURE_PAGES_SCRIPT } from './measureScript.js';
 import { SerialQueue } from './serialQueue.js';
 
 export class PdfRenderError extends Error {}
@@ -13,6 +15,8 @@ export interface PdfRenderer {
   render(html: string, options?: RenderOptions): Promise<Buffer>;
   // Mermaidの図をSVGにする。結果は入力と同じ順で返し、描けなかった図は、理由つきの失敗にする
   drawDiagrams(sources: readonly string[]): Promise<DiagramOutcome[]>;
+  // PDFにしたとき、各ページが、文書のどこから始まるかを測る(PDFと同じA4・余白で分割する。Markdownから作った文書用)
+  measurePages(html: string): Promise<PageLayout>;
   chromiumVersion(): Promise<string>;
 }
 
@@ -103,7 +107,12 @@ export function createPdfRenderer(options: PdfRendererOptions): PdfRenderer {
           await page.setContent(html, { waitUntil: 'load', timeout: options.timeoutMs });
           const pdf = await page.pdf({
             format: 'A4',
-            margin: { top: '20mm', bottom: '25mm', left: '20mm', right: '20mm' },
+            margin: {
+              top: `${PAGE.marginTopMm}mm`,
+              bottom: `${PAGE.marginBottomMm}mm`,
+              left: `${PAGE.marginSideMm}mm`,
+              right: `${PAGE.marginSideMm}mm`,
+            },
             printBackground: true,
             preferCSSPageSize: renderOptions?.preferCssPageSize ?? false,
             displayHeaderFooter: true,
@@ -114,6 +123,30 @@ export function createPdfRenderer(options: PdfRendererOptions): PdfRenderer {
           return Buffer.from(pdf);
         } catch (cause) {
           throw new PdfRenderError(`PDFの生成に失敗しました: ${messageOf(cause)}`, { cause });
+        } finally {
+          if (browser !== undefined) {
+            await closeBrowser(browser);
+          }
+        }
+      });
+    },
+
+    measurePages(html: string): Promise<PageLayout> {
+      return queue.run(async () => {
+        let browser: Browser | undefined;
+        try {
+          browser = await launch();
+          const page = await browser.newPage();
+          page.setDefaultTimeout(options.timeoutMs);
+          await blockExternalRequests(page);
+          // 測るためにスクリプトを実行できるようにするが、実行するのは、こちらが渡す測定用のスクリプトだけ。
+          // 文書は、Markdownから作ったもの(生HTMLは、文字として表示するだけ)で、CSPでも、文書内のスクリプトを禁じている。
+          // 印刷用のCSS(表の見出し行の繰り返し・行の途中で改ページしない)を、PDFと同じように効かせる
+          await page.emulateMediaType('print');
+          await page.setContent(html, { waitUntil: 'load', timeout: options.timeoutMs });
+          return (await page.evaluate(`${MEASURE_PAGES_SCRIPT}(${CONTENT_WIDTH_PX}, ${CONTENT_HEIGHT_PX})`)) as PageLayout;
+        } catch (cause) {
+          throw new PdfRenderError(`ページの区切りを測れませんでした: ${messageOf(cause)}`, { cause });
         } finally {
           if (browser !== undefined) {
             await closeBrowser(browser);

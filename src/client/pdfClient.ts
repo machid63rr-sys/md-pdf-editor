@@ -11,9 +11,9 @@ export interface PdfSource {
 
 export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
 
-const defaultFetch: FetchLike = (input, init) => fetch(input, init);
+export const defaultFetch: FetchLike = (input, init) => fetch(input, init);
 
-async function readErrorMessage(response: Response): Promise<string> {
+export async function readErrorMessage(response: Response): Promise<string> {
   try {
     const body = (await response.json()) as { error?: { message?: unknown } };
     if (typeof body.error?.message === 'string') {
@@ -25,7 +25,7 @@ async function readErrorMessage(response: Response): Promise<string> {
   return `サーバがエラーを返しました (HTTP ${response.status})。`;
 }
 
-function requestBody(source: PdfSource): Record<string, unknown> {
+export function requestBody(source: PdfSource): Record<string, unknown> {
   if (source.kind === 'html') {
     return { html: source.text };
   }

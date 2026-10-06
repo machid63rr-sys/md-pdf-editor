@@ -1,6 +1,7 @@
 import express, { type ErrorRequestHandler, type Express, type NextFunction, type Request, type Response } from 'express';
+import type { DiagramOutcome } from '../shared/mermaid.js';
 import { prepareHtmlForPdf } from './htmlDocument.js';
-import { buildDocumentHtml, extractMermaidSources, type DiagramMap, type MarkdownAssets } from './markdownToHtml.js';
+import { buildDocumentHtml, extractMermaidSources, type DiagramMap, type MarkdownAssets, type RenderOptions } from './markdownToHtml.js';
 import { PdfRenderError, type PdfRenderer } from './pdf.js';
 
 export interface AppDependencies {
@@ -98,19 +99,40 @@ function parseSource(body: unknown, maxBytes: number): PdfSource {
   return parsedAssets === undefined ? { kind, text } : { kind, text, assets: parsedAssets };
 }
 
-// Markdownの中のMermaidの図を描画する。図が無ければ、ブラウザを起動しない
-async function drawDiagrams(renderer: PdfRenderer, markdown: string): Promise<DiagramMap | undefined> {
-  const sources = extractMermaidSources(markdown);
-  if (sources.length === 0) {
-    return undefined;
-  }
-  const drawn = await renderer.drawDiagrams(sources.slice(0, MAX_DIAGRAMS));
-  return new Map(
-    sources.map((source, index) => [source, drawn[index] ?? { ok: false, message: `図が多すぎるため描画しません(上限 ${MAX_DIAGRAMS} 個)` }]),
-  );
+// 描画した図の覚え(同じ内容の図を、何度も描き直さないため。ページの区切りの測定は、編集のたびに呼ばれる)
+const MAX_CACHED_DIAGRAMS = 200;
+
+/** Markdownの中のMermaidの図を描画する関数。図が無ければ、ブラウザを起動しない */
+function createDiagramDrawer(renderer: PdfRenderer): (markdown: string) => Promise<DiagramMap | undefined> {
+  const cache = new Map<string, DiagramOutcome>();
+  return async (markdown) => {
+    const sources = extractMermaidSources(markdown);
+    if (sources.length === 0) {
+      return undefined;
+    }
+    const limited = sources.slice(0, MAX_DIAGRAMS);
+    const missing = limited.filter((source) => !cache.has(source));
+    if (missing.length > 0) {
+      const drawn = await renderer.drawDiagrams(missing);
+      missing.forEach((source, index) => cache.set(source, drawn[index] ?? { ok: false, message: '図を描画できませんでした' }));
+      while (cache.size > MAX_CACHED_DIAGRAMS) {
+        cache.delete(cache.keys().next().value as string);
+      }
+    }
+    return new Map(
+      sources.map((source, index): [string, DiagramOutcome] => [
+        source,
+        index < MAX_DIAGRAMS ? (cache.get(source) ?? { ok: false, message: '図を描画できませんでした' }) : { ok: false, message: `図が多すぎるため描画しません(上限 ${MAX_DIAGRAMS} 個)` },
+      ]),
+    );
+  };
 }
 
 export function createApp(deps: AppDependencies): Express {
+  const drawDiagrams = createDiagramDrawer(deps.renderer);
+  // MarkdownをPDFにする文書(HTML)にする。PDF生成とページの区切りの測定で、同じ文書を使う
+  const markdownDocument = async (source: PdfSource, options?: RenderOptions): Promise<string> =>
+    buildDocumentHtml(source.text, deps.css, source.assets, await drawDiagrams(source.text), options);
   const app = express();
   app.disable('x-powered-by');
   app.use(securityHeaders);
@@ -127,10 +149,22 @@ export function createApp(deps: AppDependencies): Express {
     const source = parseSource(req.body, deps.maxMarkdownBytes);
     const pdf =
       source.kind === 'markdown'
-        ? await deps.renderer.render(buildDocumentHtml(source.text, deps.css, source.assets, await drawDiagrams(deps.renderer, source.text)))
+        ? await deps.renderer.render(await markdownDocument(source))
         : await deps.renderer.render(prepareHtmlForPdf(source.text), { preferCssPageSize: true });
     res.status(200).type('application/pdf').setHeader('Cache-Control', 'no-store');
     res.send(pdf);
+  });
+
+  // PDFにしたときの、ページの区切り位置(編集画面のプレビューに表示する)。リクエストは /api/pdf と同じ
+  app.post('/api/layout', jsonParser, async (req, res) => {
+    const source = parseSource(req.body, deps.maxMarkdownBytes);
+    if (source.kind !== 'markdown') {
+      throw invalid('ページの区切りの測定は、markdown のときだけ指定できます。');
+    }
+    // 画面のプレビューへ位置を対応づけるため、ブロックにMarkdownでの番号を付けて測る(PDFの見た目は変わらない)
+    const layout = await deps.renderer.measurePages(await markdownDocument(source, { tagBlocks: true }));
+    res.status(200).setHeader('Cache-Control', 'no-store');
+    res.json(layout);
   });
 
   app.use('/api', (_req, res) => {

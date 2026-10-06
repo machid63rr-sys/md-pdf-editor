@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import type { Server } from 'node:http';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { DiagramOutcome } from '../shared/mermaid.js';
+import type { PageLayout } from '../shared/pageLayout.js';
 import { createApp } from './app.js';
 import { PdfRenderError, type PdfRenderer, type RenderOptions } from './pdf.js';
 
@@ -15,6 +16,8 @@ class RecordingRenderer implements PdfRenderer {
   readonly options: (RenderOptions | undefined)[] = [];
   // 図の描画を頼まれた、Mermaidのコード(呼び出しごと)
   readonly drawn: (readonly string[])[] = [];
+  // ページの区切りの測定を頼まれた、HTML(呼び出しごと)
+  readonly measured: string[] = [];
   failWith: Error | undefined;
 
   render(html: string, options?: RenderOptions): Promise<Buffer> {
@@ -29,6 +32,13 @@ class RecordingRenderer implements PdfRenderer {
     return Promise.resolve(
       sources.map((source): DiagramOutcome => (source.includes('ok') ? { ok: true, svg: '<svg viewBox="0 0 10 20"></svg>' } : { ok: false, message: 'Parse error' })),
     );
+  }
+
+  measurePages(html: string): Promise<PageLayout> {
+    this.measured.push(html);
+    return this.failWith
+      ? Promise.reject(this.failWith)
+      : Promise.resolve({ pages: 2, starts: [{ kind: 'start', page: 2, block: 1, tag: 'p', snippet: '本文' }] });
   }
 
   chromiumVersion(): Promise<string> {
@@ -59,6 +69,8 @@ afterAll(async () => {
 
 const postPdf = (body: string, contentType = 'application/json'): Promise<Response> =>
   fetch(`${baseUrl}/api/pdf`, { method: 'POST', headers: { 'Content-Type': contentType }, body });
+const postLayout = (markdown: string): Promise<Response> =>
+  fetch(`${baseUrl}/api/layout`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ markdown }) });
 
 describe('GET /healthz', () => {
   it('okとChromiumの版を返す', async () => {
@@ -79,6 +91,7 @@ describe('POST /api/pdf', () => {
     expect(Buffer.from(await res.arrayBuffer()).subarray(0, 5).toString('latin1')).toBe('%PDF-');
     expect(renderer.htmls).toHaveLength(1);
     expect(renderer.htmls[0]).toContain('<h1>見出し</h1>');
+    expect(renderer.htmls[0]).not.toContain('data-block');
     expect(renderer.htmls[0]).toContain('.document{}');
   });
 
@@ -97,15 +110,70 @@ describe('POST /api/pdf', () => {
     expect(renderer.options[0]).toEqual({ preferCssPageSize: true });
   });
 
+  describe('POST /api/layout(ページの区切りの測定)', () => {
+    it('Markdownを渡すと、測った結果をJSONで返し、PDFと同じ文書(共有CSSつき)が測定に渡る', async () => {
+      renderer.measured.length = 0;
+      const res = await postLayout('# 見出し\n\n本文');
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-type')).toContain('application/json');
+      expect(res.headers.get('cache-control')).toBe('no-store');
+      expect(await res.json()).toEqual({ pages: 2, starts: [{ kind: 'start', page: 2, block: 1, tag: 'p', snippet: '本文' }] });
+      expect(renderer.measured).toHaveLength(1);
+      // 測る文書の最上位のブロックには、Markdownでの番号が付く(PDFの文書には付かない)
+      expect(renderer.measured[0]).toContain('<h1 data-block="0">見出し</h1>');
+      expect(renderer.measured[0]).toContain('<p data-block="1">本文</p>');
+      expect(renderer.measured[0]).toContain('.document{}');
+    });
+
+    it('画像(baseDir・assets)つきのMarkdownも、PDFと同じように、画像を含む文書で測る', async () => {
+      renderer.measured.length = 0;
+      const dataUri = 'data:image/png;base64,iVBORw==';
+      await fetch(`${baseUrl}/api/layout`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ markdown: '![図](img/a.png)', baseDir: 'docs', assets: { 'docs/img/a.png': dataUri } }),
+      });
+      expect(renderer.measured[0]).toContain(`<img src="${dataUri}" alt="図">`);
+    });
+
+    it('HTMLは測れず、400', async () => {
+      const res = await fetch(`${baseUrl}/api/layout`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ html: '<p>a</p>' }) });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe('invalid_request');
+    });
+
+    it.each([
+      ['空のMarkdown', { markdown: '  ' }, 400],
+      ['markdownもhtmlも無い', {}, 400],
+      ['大きすぎる', { markdown: 'あ'.repeat(MAX_BYTES) }, 413],
+    ])('不正なリクエスト(%s)は、PDFと同じ検証で断る', async (_label, body, status) => {
+      renderer.measured.length = 0;
+      const res = await fetch(`${baseUrl}/api/layout`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      expect(res.status).toBe(status);
+      expect(renderer.measured).toEqual([]);
+    });
+
+    it('測定に失敗したら、500とメッセージを返す', async () => {
+      renderer.failWith = new PdfRenderError('ページの区切りを測れませんでした: x');
+      try {
+        const res = await postLayout('# a');
+        expect(res.status).toBe(500);
+        expect(((await res.json()) as { error: { code: string; message: string } }).error).toEqual({ code: 'pdf_failed', message: 'ページの区切りを測れませんでした: x' });
+      } finally {
+        renderer.failWith = undefined;
+      }
+    });
+  });
+
   describe('Mermaidの図', () => {
     const post = (markdown: string): Promise<Response> => postPdf(JSON.stringify({ markdown }));
 
     it('図があれば、描画を依頼し、描けた図がPDFのHTMLに入る', async () => {
       renderer.htmls.length = 0;
       renderer.drawn.length = 0;
-      const res = await post('```mermaid\ngraph ok\n```');
+      const res = await post('```mermaid\ngraph ok 1\n```');
       expect(res.status).toBe(200);
-      expect(renderer.drawn).toEqual([['graph ok']]);
+      expect(renderer.drawn).toEqual([['graph ok 1']]);
       expect(renderer.htmls[0]).toContain('<figure class="mermaid-diagram">');
     });
 
@@ -119,8 +187,22 @@ describe('POST /api/pdf', () => {
 
     it('同じ図は1回だけ描画を依頼する', async () => {
       renderer.drawn.length = 0;
-      await post('```mermaid\ngraph ok\n```\n\n```mermaid\ngraph ok\n```');
-      expect(renderer.drawn).toEqual([['graph ok']]);
+      await post('```mermaid\ngraph ok 2\n```\n\n```mermaid\ngraph ok 2\n```');
+      expect(renderer.drawn).toEqual([['graph ok 2']]);
+    });
+
+    it('描いた図は覚えておき、同じ図は、PDFの生成やページの区切りの測定を重ねても、描き直さない(描けなかった図も)', async () => {
+      renderer.drawn.length = 0;
+      renderer.htmls.length = 0;
+      const markdown = '```mermaid\ngraph ok 5\n```\n\n```mermaid\nbad diagram 5\n```';
+      await post(markdown);
+      await postLayout(markdown);
+      await post(markdown);
+      expect(renderer.drawn).toEqual([['graph ok 5', 'bad diagram 5']]);
+      // 新しい図が加われば、その図だけを描く
+      await post(`${markdown}\n\n\`\`\`mermaid\ngraph ok 6\n\`\`\``);
+      expect(renderer.drawn).toEqual([['graph ok 5', 'bad diagram 5'], ['graph ok 6']]);
+      expect(renderer.htmls.at(-1)?.match(/<figure/g)).toHaveLength(2);
     });
 
     it('図が無ければ、描画を依頼しない(ブラウザを余計に起動しない)', async () => {
@@ -132,13 +214,13 @@ describe('POST /api/pdf', () => {
     it('コードのみ(show=code)の図は、描画を依頼しない。両方(show=both)は描いて、コードと図が入る', async () => {
       renderer.htmls.length = 0;
       renderer.drawn.length = 0;
-      await post('```mermaid show=code\ngraph ok\n```');
+      await post('```mermaid show=code\ngraph ok 3\n```');
       expect(renderer.drawn).toEqual([]);
-      expect(renderer.htmls[0]).toContain('<pre><code class="language-mermaid">graph ok');
+      expect(renderer.htmls[0]).toContain('<pre><code class="language-mermaid">graph ok 3');
       expect(renderer.htmls[0]).not.toContain('<figure');
 
-      await post('```mermaid show=both\ngraph ok\n```');
-      expect(renderer.drawn).toEqual([['graph ok']]);
+      await post('```mermaid show=both\ngraph ok 4\n```');
+      expect(renderer.drawn).toEqual([['graph ok 4']]);
       expect(renderer.htmls[1]).toContain('<pre>');
       expect(renderer.htmls[1]).toContain('<figure');
     });

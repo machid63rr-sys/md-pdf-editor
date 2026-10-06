@@ -65,6 +65,50 @@ function imageNodeOf(tag: ImageTag): Image {
   return { type: 'image', url: tag.src, alt: tag.alt, title: tag.title ?? null, data: { hProperties: size } };
 }
 
+/*
+ * 本文の最上位のブロック(見出し・段落・リスト・表・コード・図など)に、Markdownでの番号(0始まり)を付ける(data-block)。
+ * ページの区切りの測定用(画面のプレビューは、Markdownのブロックごとに並ぶため、その番号で位置を対応づける)。
+ * Mermaidの図のように、1つのブロックが、PDFでは複数の要素(コードと図、理由とコードなど)になる場合も、同じ番号を付ける。
+ * PDFの文書には付けない(tagBlocks が true のときだけ)。
+ */
+type BlockData = { sourceBlock?: number };
+
+// 要素のdataに、ブロック番号を加える(mdastの型は、独自の項目を持てないため、型を保ったまま、値だけを足す)
+const withBlock = <T extends object | undefined>(data: T, sourceBlock: number): T => Object.assign({}, data, { sourceBlock }) as T;
+
+function remarkMarkBlocks() {
+  return (tree: MdastRoot, file: { data: object }): void => {
+    if ((file.data as { tagBlocks?: boolean }).tagBlocks !== true) {
+      return;
+    }
+    tree.children.forEach((child, index) => {
+      child.data = withBlock(child.data, index);
+    });
+  };
+}
+
+// 置き換えた要素に、元の要素のブロック番号を引き継ぐ
+function inheritBlock(from: RootContent, replacements: readonly RootContent[]): void {
+  const sourceBlock = (from.data as BlockData | undefined)?.sourceBlock;
+  if (sourceBlock !== undefined) {
+    for (const replacement of replacements) {
+      replacement.data = withBlock(replacement.data, sourceBlock);
+    }
+  }
+}
+
+function remarkBlocksToProperties() {
+  return (tree: MdastRoot): void => {
+    for (const child of tree.children) {
+      const sourceBlock = (child.data as BlockData | undefined)?.sourceBlock;
+      if (sourceBlock !== undefined) {
+        const data = child.data as { hProperties?: Record<string, unknown> };
+        data.hProperties = { ...data.hProperties, dataBlock: String(sourceBlock) };
+      }
+    }
+  };
+}
+
 // 生HTML(html)とfront matter(yaml)を、実行もせず消しもしない形に置き換える。<img> のタグだけは、画像にする
 function remarkNeutralizeRawContent() {
   return (tree: MdastRoot): void => {
@@ -82,6 +126,7 @@ function remarkNeutralizeRawContent() {
       } else {
         return undefined;
       }
+      inheritBlock(node as RootContent, replacement);
       parent.children.splice(index, 1, ...(replacement as typeof parent.children));
       return [SKIP, index + replacement.length];
     });
@@ -191,9 +236,25 @@ function remarkMermaidDiagrams() {
         // 両方のときは、エディタと同じ並び(コードの下に図)にする
         replacement = view === 'both' ? [node, figure] : [figure];
       }
+      inheritBlock(node, replacement);
       parent.children.splice(index, 1, ...(replacement as typeof parent.children));
       return [SKIP, index + replacement.length];
     });
+  };
+}
+
+// コードブロックでは、ブロック番号の属性が、<pre> の中の <code> に付くため、<pre>(最上位の要素)へ移す
+function rehypeLiftBlockNumber() {
+  return (tree: HastRoot): void => {
+    for (const child of tree.children) {
+      if (child.type === 'element' && child.tagName === 'pre') {
+        const code = child.children.find((node): node is HastElement => node.type === 'element' && node.tagName === 'code');
+        if (code?.properties['dataBlock'] !== undefined) {
+          child.properties['dataBlock'] = code.properties['dataBlock'];
+          delete code.properties['dataBlock'];
+        }
+      }
+    }
   };
 }
 
@@ -217,10 +278,13 @@ const processor = unified()
   .use(remarkFrontmatter, ['yaml'])
   .use(remarkGfm)
   .use(remarkBreaks)
+  .use(remarkMarkBlocks)
   .use(remarkNeutralizeRawContent)
   .use(remarkMermaidDiagrams)
+  .use(remarkBlocksToProperties)
   .use(remarkRehype)
   .use(rehypeNeutralizeUrls)
+  .use(rehypeLiftBlockNumber)
   .use(rehypeSkipHugeCode)
   // 言語名が登録されていないコードは、そのまま表示される(エラーにならない)
   .use(rehypeHighlight, { languages: allLanguages, plainText: PLAIN_TEXT_LANGUAGES })
@@ -249,10 +313,15 @@ export interface RenderedMarkdown {
   readonly bodyHtml: string;
 }
 
-export function renderMarkdown(markdown: string, assets?: MarkdownAssets, diagrams?: DiagramMap): RenderedMarkdown {
+export interface RenderOptions {
+  // 最上位のブロックに、Markdownでの番号(data-block)を付ける(ページの区切りの測定用。PDFには付けない)
+  readonly tagBlocks?: boolean;
+}
+
+export function renderMarkdown(markdown: string, assets?: MarkdownAssets, diagrams?: DiagramMap, options?: RenderOptions): RenderedMarkdown {
   const mdast = processor.parse(markdown);
   const title = extractTitle(mdast);
-  const hast = processor.runSync(mdast, { data: { markdownAssets: assets, diagrams } }) as HastRoot;
+  const hast = processor.runSync(mdast, { data: { markdownAssets: assets, diagrams, tagBlocks: options?.tagBlocks === true } }) as HastRoot;
   return { title, bodyHtml: String(processor.stringify(hast)) };
 }
 
@@ -268,8 +337,8 @@ export function extractMermaidSources(markdown: string): string[] {
 }
 
 // PDF化するHTML全体。メタタグのCSPは、Chromium側の通信遮断に加えた二重の防御
-export function buildDocumentHtml(markdown: string, css: string, assets?: MarkdownAssets, diagrams?: DiagramMap): string {
-  const { title, bodyHtml } = renderMarkdown(markdown, assets, diagrams);
+export function buildDocumentHtml(markdown: string, css: string, assets?: MarkdownAssets, diagrams?: DiagramMap, options?: RenderOptions): string {
+  const { title, bodyHtml } = renderMarkdown(markdown, assets, diagrams, options);
   return [
     '<!doctype html>',
     '<html lang="ja"><head><meta charset="utf-8">',

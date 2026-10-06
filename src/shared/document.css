@@ -2,7 +2,7 @@
  * 文書の見た目。プレビュー(.md-editor-content)とPDF(.document)の両方に同じものを適用し、
  * 見出し・表の罫線・コードなどの見え方を揃える。
  * PDFはサーバ上のNoto Sans CJK JPで描画される。プレビューはブラウザのOSフォントになるため、
- * 字形や折り返し位置が少し異なることがある(改ページ位置もプレビューでは再現されない)。
+ * 字形や折り返し位置が少し異なることがある(ページの区切りは、サーバがPDFと同じ条件で測った位置を、プレビューに重ねて表示する)。
  */
 :is(.document, .md-editor-content) {
   font-family: 'Noto Sans CJK JP', 'Noto Sans JP', 'Yu Gothic', 'Meiryo', sans-serif;

@@ -443,3 +443,54 @@ body {
   gap: 4px;
   cursor: pointer;
 }
+
+/* プレビューの上に重ねる、PDFのページの区切り */
+.md-editor-drop {
+  position: relative;
+}
+.page-overlay {
+  position: absolute;
+  overflow: hidden;
+  pointer-events: none;
+}
+.page-overlay-inner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  will-change: transform;
+}
+.page-break {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 0;
+  border-top: 2px dashed #e11d48;
+  transition: opacity 0.2s;
+}
+.page-break-stale {
+  opacity: 0.35;
+}
+.page-break-label {
+  position: absolute;
+  right: 8px;
+  top: -11px;
+  padding: 0 8px;
+  border-radius: 10px;
+  background: #e11d48;
+  color: #fff;
+  font-size: 11px;
+  line-height: 20px;
+  white-space: nowrap;
+}
+.page-status {
+  margin: 6px 2px 0;
+  color: #9f1239;
+  font-size: 12px;
+}
+.page-status-stale {
+  color: var(--muted);
+}
+.page-status-error {
+  color: #b91c1c;
+}

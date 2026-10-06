@@ -1784,3 +1784,493 @@ describe('画像のドラッグ&ドロップによる埋め込み(実ブラウ�
     });
   });
 });
+
+describe('空行(空の段落)(実ブラウザ)', () => {
+  const NBSP_CHAR = '\u00a0';
+  const BASE = '# 題\n\n最初の段落です。\n';
+
+  const markdownTab = async (): Promise<string> => {
+    await clickButton('Markdown');
+    await page.waitForSelector('textarea[aria-label="Markdown"]');
+    return sourceValue();
+  };
+
+  // 「最初の段落」の末尾で、Enterを3回押し(空の段落を2つ作り)、文字を入力する
+  const typeAfterBlankParagraphs = async (): Promise<void> => {
+    await page.click('.md-editor-content p');
+    await page.keyboard.press('End');
+    await page.keyboard.press('Enter');
+    await page.keyboard.press('Enter');
+    await page.keyboard.press('Enter');
+    await page.keyboard.type('空行のあとの段落です。');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  };
+
+  const paragraphTexts = (): Promise<string[]> => page.$$eval('.md-editor-content p', (items) => items.map((item) => item.textContent ?? ''));
+
+  it('Enterで空行を作って文字を入力すると、Markdownには、空の段落が「&nbsp;」の段落として保存される(空行が重なるだけにならない)', async () => {
+    await openEditor(BASE);
+    await typeAfterBlankParagraphs();
+    expect(await paragraphTexts()).toEqual(['最初の段落です。', '', '', '空行のあとの段落です。']);
+
+    const markdown = await markdownTab();
+    expect(markdown).toBe('# 題\n\n最初の段落です。\n\n&nbsp;\n\n&nbsp;\n\n空行のあとの段落です。');
+    // 見えない空白(U+00A0)そのものは、保存されない
+    expect(markdown).not.toContain(NBSP_CHAR);
+    expect(markdown).not.toMatch(/\n{4,}/);
+  });
+
+  it('PDFでも、空行が詰まらず、空の段落の数だけ、段落の間が空く', async () => {
+    await openEditor(BASE);
+    await typeAfterBlankParagraphs();
+    const markdown = await markdownTab();
+
+    const gapOf = async (text: string): Promise<number> => {
+      const response = await fetch(`${baseUrl}/api/pdf`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ markdown: text }) });
+      expect(response.status).toBe(200);
+      const path = join(mkdtempSync(join(tmpdir(), 'md-pdf-editor-blank-')), 'out.pdf');
+      writeFileSync(path, Buffer.from(await response.arrayBuffer()));
+      const xml = execFileSync('pdftotext', ['-bbox', path, '-'], { encoding: 'utf8' });
+      const y = (word: string): number => Number(new RegExp(`yMin="([\\d.]+)"[^>]*>${word}</word>`).exec(xml)?.[1]);
+      return y('空行のあとの段落です。') - y('最初の段落です。');
+    };
+    const withBlanks = await gapOf(markdown);
+    const withoutBlanks = await gapOf('# 題\n\n最初の段落です。\n\n空行のあとの段落です。');
+    // 空の段落2つ分(1つにつき約25pt)
+    expect(withBlanks - withoutBlanks).toBeGreaterThan(44);
+    expect(withBlanks - withoutBlanks).toBeLessThan(56);
+  });
+
+  it('Markdownタブへ切り替えて、プレビューに戻っても、空の段落が残る(消えない)', async () => {
+    await openEditor(BASE);
+    await typeAfterBlankParagraphs();
+    await markdownTab();
+    await clickButton('プレビュー');
+    await page.waitForSelector('.md-editor-content h1');
+    expect(await paragraphTexts()).toEqual(['最初の段落です。', '', '', '空行のあとの段落です。']);
+  });
+
+  it('空の段落に文字を入力しても、先頭に見えない空白が残らない', async () => {
+    await openEditor('# 題\n\n最初の段落です。\n\n&nbsp;\n\n&nbsp;\n\n最後の段落です。');
+    await page.waitForFunction(() => document.querySelectorAll('.md-editor-content p').length === 4);
+    // 2番目の段落(1つ目の空の段落)に入力する
+    await (await page.$$('.md-editor-content p'))[1]?.click();
+    await page.keyboard.type('追加した段落');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const markdown = await markdownTab();
+    expect(markdown).toBe('# 題\n\n最初の段落です。\n\n追加した段落\n\n&nbsp;\n\n最後の段落です。');
+    expect(markdown).not.toContain(NBSP_CHAR);
+  });
+
+  it('「&nbsp;」の段落を含むMarkdownは、編集しなければ、取り込んだままで、プレビューには空の段落として表示される', async () => {
+    const markdown = '# 題\n\n&nbsp;\n\n最初の段落です。\n\n&nbsp;\n\n&nbsp;\n\n最後の段落です。';
+    await openEditor(markdown);
+    await page.waitForFunction(() => document.querySelectorAll('.md-editor-content p').length === 5);
+    expect(await paragraphTexts()).toEqual(['', '最初の段落です。', '', '', '最後の段落です。']);
+    expect(await markdownTab()).toBe(markdown);
+  });
+
+  it('末尾に、エディタが置く空の段落(表で終わる文書など)は、保存されない', async () => {
+    await openEditor('# 題\n\n| a | b |\n| - | - |\n| 1 | 2 |');
+    await page.waitForSelector('.md-editor-content table');
+    await page.click('.md-editor-content h1');
+    await page.keyboard.press('End');
+    await page.keyboard.type('(編集)');
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const markdown = await markdownTab();
+    expect(markdown).toContain('# 題(編集)');
+    expect(markdown).not.toContain('&nbsp;');
+  });
+
+  describe('段落の中の改行(Shift+Enter)', () => {
+    const shiftEnter = async (times: number): Promise<void> => {
+      await page.keyboard.down('Shift');
+      for (let count = 0; count < times; count += 1) {
+        await page.keyboard.press('Enter');
+      }
+      await page.keyboard.up('Shift');
+    };
+
+    const typeAfterLineBreaks = async (times: number): Promise<void> => {
+      await page.click('.md-editor-content p');
+      await page.keyboard.press('End');
+      await shiftEnter(times);
+      await page.keyboard.type('改行のあとの文です。');
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    };
+
+    it('改行が続くとき(2つ以上)は、強制改行(行末の「\\」)として保存され、1つの段落のまま、段落が分かれない', async () => {
+      await openEditor(`${BASE}\n次の段落です。`);
+      await typeAfterLineBreaks(3);
+      // プレビューは、1つの段落の中に、改行が3つ
+      expect(await paragraphTexts()).toEqual(['最初の段落です。改行のあとの文です。', '次の段落です。']);
+      expect(await page.$$eval('.md-editor-content p br', (items) => items.length)).toBe(3);
+      expect(await markdownTab()).toBe('# 題\n\n最初の段落です。\\\n\\\n\\\n改行のあとの文です。\n\n次の段落です。');
+    });
+
+    it('改行が1つだけのときは、これまでどおり、ただの改行(「\\」を付けない)', async () => {
+      await openEditor(`${BASE}\n次の段落です。`);
+      await typeAfterLineBreaks(1);
+      expect(await markdownTab()).toBe('# 題\n\n最初の段落です。\n改行のあとの文です。\n\n次の段落です。');
+    });
+
+    it('Markdownタブへ切り替えて、プレビューに戻っても、改行が3つの1つの段落のまま(段落の数が変わらない)', async () => {
+      await openEditor(`${BASE}\n次の段落です。`);
+      await typeAfterLineBreaks(3);
+      await markdownTab();
+      await clickButton('プレビュー');
+      await page.waitForSelector('.md-editor-content h1');
+      expect(await paragraphTexts()).toEqual(['最初の段落です。改行のあとの文です。', '次の段落です。']);
+      expect(await page.$$eval('.md-editor-content p br', (items) => items.length)).toBe(3);
+    });
+
+    it('PDFでも、改行の数だけ、行が空く(段落が分かれて、詰まったりしない)', async () => {
+      await openEditor(`${BASE}\n次の段落です。`);
+      await typeAfterLineBreaks(3);
+      const markdown = await markdownTab();
+      const lineGap = async (text: string): Promise<number> => {
+        const response = await fetch(`${baseUrl}/api/pdf`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ markdown: text }) });
+        expect(response.status).toBe(200);
+        const path = join(mkdtempSync(join(tmpdir(), 'md-pdf-editor-break-')), 'out.pdf');
+        writeFileSync(path, Buffer.from(await response.arrayBuffer()));
+        const xml = execFileSync('pdftotext', ['-bbox', path, '-'], { encoding: 'utf8' });
+        const y = (word: string): number => Number(new RegExp(`yMin="([\\d.]+)"[^>]*>${word}</word>`).exec(xml)?.[1]);
+        return y('改行のあとの文です。') - y('最初の段落です。');
+      };
+      const withBreaks = await lineGap(markdown);
+      const withoutBreaks = await lineGap('# 題\n\n最初の段落です。\n改行のあとの文です。');
+      // 空いた改行の数 = 2つ(3つの改行のうち、1つは、行を分ける改行)。1つにつき、行の高さ(約18.7pt)
+      expect(withBreaks - withoutBreaks).toBeGreaterThan(34);
+      expect(withBreaks - withoutBreaks).toBeLessThan(40);
+    });
+  });
+
+  it('コードブロックの中の空行は、「&nbsp;」にならない', async () => {
+    await openEditor('# 題\n\n```text\nA\n\n\n\nB\n```');
+    await page.waitForSelector('.cm-editor');
+    await page.click('.md-editor-content h1');
+    await page.keyboard.press('End');
+    await page.keyboard.type('x');
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const markdown = await markdownTab();
+    expect(markdown).toContain('```text\nA\n\n\n\nB\n```');
+    expect(markdown).not.toContain('&nbsp;');
+  });
+});
+
+describe('ページの区切りの表示(実ブラウザ)', () => {
+  // 文ごとに番号を入れて、どの文がどのページの先頭かを、文書の中で一意に決められるようにする
+  const para = (label: string, sentences = 8): string =>
+    Array.from({ length: sentences }, (_, index) => `${label}の文${index + 1}番です。PDFのページの区切りを確かめるための文章です。`).join('');
+
+  // 3ページ以上になる文書(見出し・段落・リスト・表)
+  const longDocument = (): string => {
+    const parts: string[] = ['# 長い文書', ''];
+    for (let chapter = 1; chapter <= 4; chapter += 1) {
+      parts.push(`## 第${chapter}章`, '', para(`第${chapter}章A`), '', para(`第${chapter}章B`, 5), '');
+      parts.push(...Array.from({ length: 5 }, (_, index) => `- 第${chapter}章の項目${index + 1} ${'説明の文章'.repeat(6)}`), '');
+      if (chapter === 2) {
+        parts.push('| 番号 | 名前 |', '| --- | --- |', ...Array.from({ length: 30 }, (_, index) => `| ${index + 1} | 行${index + 1}の名前 |`), '');
+      }
+    }
+    return parts.join('\n');
+  };
+
+  const statusText = (): Promise<string> => page.$eval('.page-status', (element) => (element as HTMLElement).innerText);
+
+  // 測定が終わり(測り直し中でない)、「全Nページ」が表示されるまで待って、Nを返す
+  const settledTotalPages = async (): Promise<number> => {
+    await page.waitForFunction(
+      () => /全\d+ページ/.test(document.querySelector('.page-status')?.textContent ?? '') && !document.querySelector('.page-status-stale, .page-break-stale'),
+      { timeout: 30_000 },
+    );
+    return Number(/全(\d+)ページ/.exec(await statusText())?.[1]);
+  };
+
+  const breakPages = (): Promise<string[]> => page.$$eval('.page-break', (lines) => lines.map((line) => (line as HTMLElement).dataset['page'] ?? ''));
+  const breakTops = (): Promise<number[]> => page.$$eval('.page-break', (lines) => lines.map((line) => line.getBoundingClientRect().top));
+
+  // プレビューの本文の中で、空白を除いた文字列 needle が、ちょうど1か所だけ現れる位置の上端(画面上のy座標)。見つからなければ null
+  const topOfText = (needle: string): Promise<number | null> =>
+    page.evaluate((target) => {
+      const root = document.querySelector('.md-editor-content') as HTMLElement;
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      const entries: { node: Text; index: number }[] = [];
+      let joined = '';
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        const text = node as Text;
+        if (text.parentElement?.closest('button, svg, [data-tool-cell]')) {
+          continue;
+        }
+        for (let index = 0; index < text.data.length; index += 1) {
+          if (!/\s/.test(text.data.charAt(index))) {
+            joined += text.data.charAt(index);
+            entries.push({ node: text, index });
+          }
+        }
+      }
+      const at = joined.indexOf(target);
+      if (at < 0 || joined.indexOf(target, at + 1) >= 0) {
+        return null;
+      }
+      const entry = entries[at] as { node: Text; index: number };
+      const range = document.createRange();
+      range.setStart(entry.node, entry.index);
+      range.setEnd(entry.node, entry.index + 1);
+      return range.getBoundingClientRect().top;
+    }, needle);
+
+  // 線(lineTop)と、文字(textTop)の間にある、空の段落(空行)の数。いずれも、画面上のy座標
+  const blankParagraphsBetween = (lineTop: number, textTop: number): Promise<number> =>
+    page.evaluate(
+      (from, to) =>
+        [...document.querySelectorAll('.md-editor-content > p')].filter((element) => {
+          const top = element.getBoundingClientRect().top;
+          return element.textContent === '' && top >= from - 1 && top < to;
+        }).length,
+      lineTop,
+      textTop,
+    );
+
+  // 実際にPDFを出力して、ページ数を返す
+  const outputPdf = async (): Promise<{ path: string; pages: number }> => {
+    await clickButton('出力先フォルダを選択');
+    await page.waitForFunction(
+      () => !([...document.querySelectorAll('button')].find((b) => b.textContent?.includes('選んだフォルダへ'))?.disabled ?? true),
+    );
+    await clickButton('選んだフォルダへ');
+    await page.waitForSelector('.notice-success', { timeout: 60_000 });
+    const bytes = await page.evaluate(async () => {
+      const root = await navigator.storage.getDirectory();
+      const file = await (await root.getFileHandle('document.pdf')).getFile();
+      return [...new Uint8Array(await file.arrayBuffer())];
+    });
+    const path = join(mkdtempSync(join(tmpdir(), 'md-pdf-editor-pages-')), 'out.pdf');
+    writeFileSync(path, Buffer.from(bytes));
+    return { path, pages: Number(/Pages:\s+(\d+)/.exec(execFileSync('pdfinfo', [path], { encoding: 'utf8' }))?.[1]) };
+  };
+
+  it('PDFのページの切り替わり位置に、区切り線と「Nページ目」が、常に表示される', async () => {
+    await openEditor(longDocument());
+    const total = await settledTotalPages();
+    expect(total).toBeGreaterThanOrEqual(3);
+    expect(await breakPages()).toEqual(Array.from({ length: total - 1 }, (_, index) => String(index + 2)));
+    expect(await page.$eval('.page-break-label', (element) => element.textContent)).toBe('2ページ目');
+    expect(await statusText()).toContain('赤い点線が、PDFのページの区切りです');
+    await shot('22-page-breaks');
+    expect(consoleErrors).toEqual([]);
+  });
+
+  // 区切り線が、実際のPDFのページ数・各ページの先頭と一致することを確かめる
+  const expectBreaksToMatchPdf = async (): Promise<void> => {
+    const total = await settledTotalPages();
+    const pdf = await outputPdf();
+    expect(total).toBe(pdf.pages);
+
+    const tops = await breakTops();
+    expect(tops).toHaveLength(pdf.pages - 1);
+    for (const [index, lineTop] of tops.entries()) {
+      const pageNumber = index + 2;
+      let pageText = execFileSync('pdftotext', ['-raw', '-f', String(pageNumber), '-l', String(pageNumber), pdf.path, '-'], { encoding: 'utf8' }).replace(/\s+/g, '');
+      // 表の途中で始まるページは、先頭に、見出しの行が繰り返される。リストの記号(PDFの文字には含まれる)は、除く
+      pageText = pageText.replace(/^番号名前/, '').replace(/[•◦▪]/g, '');
+      // 繰り返しの文面でも、プレビューの中で1か所に決まるよう、次の文の番号まで含む長さで探す
+      const needle = pageText.slice(0, 40);
+      const textTop = await topOfText(needle);
+      expect(textTop, `ページ${pageNumber}の先頭「${needle}」が、プレビューの中に1か所だけある`).not.toBeNull();
+      // 線は、その文字の行の、上か下の、すぐ隣にある(プレビューの行の高さ以内)。
+      // ページの上端に空行が残る場合は、線は、その空行の前にある(PDFでも、ページの上端に、空行の空きがあるため)ので、空行の分だけ離れる
+      const blanks = await blankParagraphsBetween(lineTop, textTop as number);
+      expect(Math.abs((textTop as number) - lineTop), `ページ${pageNumber}: 先頭「${needle}」 y=${textTop} 線 y=${lineTop} 間の空行${blanks}`).toBeLessThanOrEqual(45 + blanks * 40);
+    }
+  };
+
+  it('線は、実際のPDFの各ページの先頭の、すぐ近くにある(ページ数も同じ。プレビューの折り返しがPDFと違っても、同じ内容の前に付く)', async () => {
+    await openEditor(longDocument());
+    await expectBreaksToMatchPdf();
+  });
+
+  it('空行(「&nbsp;」の段落)を含む文書でも、線は、実際のPDFのページの切り替わりと一致する(空の段落も、ブロックとして数える)', async () => {
+    await openEditor(longDocument().replace(/\n\n## 第/g, '\n\n&nbsp;\n\n&nbsp;\n\n&nbsp;\n\n## 第'));
+    await expectBreaksToMatchPdf();
+  });
+
+  it('空行を重ねてから文字を入力して、空行の途中でページが替わる場合、線は、入力した文字の直前ではなく、PDFと同じ空行の前に引かれる', async () => {
+    await openEditor(['# 長い文書', ...Array.from({ length: 12 }, (_, index) => para(`段落${index + 1}`, 6))].join('\n\n'));
+    await settledTotalPages();
+
+    // 4つ目の段落の末尾で、Enterを14回押して(空行を13個作って)、文字を入力する
+    const paragraphs = await page.$$('.md-editor-content > p');
+    await (paragraphs[3] as NonNullable<(typeof paragraphs)[number]>).click();
+    await page.keyboard.press('End');
+    for (let count = 0; count < 14; count += 1) {
+      await page.keyboard.press('Enter');
+    }
+    await page.keyboard.type('追加の段落です。');
+    await page.waitForSelector('.page-break-stale, .page-status-stale', { timeout: 5_000 });
+    const total = await settledTotalPages();
+
+    // PDFで、ページの先頭に残っている空行の数(2ページ目の最初の行と、空行の無い3ページ目の最初の行の、高さの差から)
+    const pdf = await outputPdf();
+    expect(total).toBe(pdf.pages);
+    const firstLineTop = (pageNumber: number): number =>
+      Number(/yMin="([\d.]+)"/.exec(execFileSync('pdftotext', ['-bbox', '-f', String(pageNumber), '-l', String(pageNumber), pdf.path, '-'], { encoding: 'utf8' }))?.[1]);
+    const blanksOnPdfPage = Math.round((firstLineTop(2) - firstLineTop(3)) / 25.3);
+    expect(blanksOnPdfPage, '2ページ目の上端に、空行が残っている(この文書では、空行の途中でページが替わる)').toBeGreaterThanOrEqual(1);
+
+    // プレビューでも、線の下に、同じ数の空の段落がある(入力した文字の段落の前)
+    const blanksBelowLine = await page.evaluate(() => {
+      const line = document.querySelector('.page-break[data-page="2"]') as HTMLElement;
+      const typed = [...document.querySelectorAll('.md-editor-content > p')].find((element) => element.textContent?.startsWith('追加の段落です。')) as HTMLElement;
+      const lineTop = line.getBoundingClientRect().top;
+      return [...document.querySelectorAll('.md-editor-content > p')].filter(
+        (element) => element.textContent === '' && element.getBoundingClientRect().top >= lineTop - 1 && element.getBoundingClientRect().top < typed.getBoundingClientRect().top,
+      ).length;
+    });
+    expect(blanksBelowLine).toBe(blanksOnPdfPage);
+    expect(await statusText()).not.toContain('表示できません');
+    await shot('24-page-break-in-blank-lines');
+    expect(consoleErrors).toEqual([]);
+  });
+
+  it('コード・Mermaidの図(図のみ・コードと図・描けない図)・引用・水平線・画像・入れ子のリスト・表が混ざった文書でも、すべての区切りが表示され、PDFの各ページの先頭の近くにある', async () => {
+    const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    const sections = Array.from({ length: 5 }, (_, n) => {
+      const chapter = n + 1;
+      return [
+        `## 節${chapter}`,
+        para(`節${chapter}の導入`, 6),
+        ['```python', ...Array.from({ length: 12 }, (_, line) => `print("節${chapter} 行${line + 1}")`), '```'].join('\n'),
+        n % 2 === 0 ? '```mermaid\ngraph TD\n  A[開始] --> B[終了]\n```' : '```mermaid show=both\ngraph LR\n  X --> Y\n```',
+        `> 節${chapter}の引用です。${'引用の文章'.repeat(8)}`,
+        `![](${png})`,
+        ['- 節' + chapter + 'の項目1', '  - 入れ子の項目A ' + '説明'.repeat(10), '  - 入れ子の項目B', '- [ ] タスク' + chapter].join('\n'),
+        ['| 番号 | 名前 |', '| --- | --- |', ...Array.from({ length: 8 }, (_, row) => `| ${chapter}-${row + 1} | 節${chapter}の行${row + 1} |`)].join('\n'),
+        '---',
+        para(`節${chapter}のまとめ`, 5),
+      ].join('\n\n');
+    });
+    await openEditor(['# 混在した文書', ...sections].join('\n\n'));
+    const total = await settledTotalPages();
+    expect(total).toBeGreaterThanOrEqual(3);
+    // すべての区切りを、プレビューの上に置けている
+    expect(await statusText()).not.toContain('表示できません');
+    expect(await breakPages()).toEqual(Array.from({ length: total - 1 }, (_, index) => String(index + 2)));
+    await shot('23-page-breaks-mixed');
+
+    const pdf = await outputPdf();
+    expect(total).toBe(pdf.pages);
+    const tops = await breakTops();
+    let checked = 0;
+    for (const [index, lineTop] of tops.entries()) {
+      const pageNumber = index + 2;
+      const rawText = execFileSync('pdftotext', ['-raw', '-f', String(pageNumber), '-l', String(pageNumber), pdf.path, '-'], { encoding: 'utf8' }).replace(/\s+/g, '');
+      // 表の見出しの行から始まるページは、見出しの下の行の文字を探すため、1行分(約45px)余計に離れる
+      const afterHeader = rawText.startsWith('番号名前');
+      const pageText = rawText.replace(/^番号名前/, '');
+      // 先頭の文字が、プレビューの中で一意に決まるページだけ、位置を確かめる(コードの行・繰り返しの文は、決まらないため飛ばす)
+      const needle = pageText.slice(0, 10);
+      const textTop = await topOfText(needle);
+      if (textTop !== null) {
+        expect(Math.abs(textTop - lineTop), `ページ${pageNumber}: 先頭「${needle}」 y=${textTop} 線 y=${lineTop}`).toBeLessThanOrEqual(afterHeader ? 110 : 45);
+        checked += 1;
+      }
+    }
+    expect(checked).toBeGreaterThanOrEqual(3);
+    expect(consoleErrors).toEqual([]);
+  });
+
+  it('1ページに収まる文書には、区切り線が無く、「全1ページ」と表示される', async () => {
+    await openEditor('# 短い文書\n\n本文です。');
+    expect(await settledTotalPages()).toBe(1);
+    expect(await page.$('.page-break')).toBeNull();
+  });
+
+  it('編集すると、測り直すまでの間は、線が薄くなり、測り終わると、新しい位置に変わる(実際のPDFとも一致する)', async () => {
+    await openEditor(longDocument());
+    const before = await settledTotalPages();
+
+    // 先頭に、長い段落を足す(後ろの区切りが、後ろへ動き、ページが増える)
+    await page.click('.md-editor-content h1');
+    await page.keyboard.press('End');
+    await page.keyboard.press('Enter');
+    await page.keyboard.type(para('追加', 60));
+    await page.waitForSelector('.page-break-stale, .page-status-stale', { timeout: 5_000 });
+    expect(await statusText()).toContain('測り直し中');
+
+    const after = await settledTotalPages();
+    expect(after).toBeGreaterThan(before);
+    expect(await breakPages()).toHaveLength(after - 1);
+    expect(after).toBe((await outputPdf()).pages);
+  });
+
+  it('プレビューをスクロールしても、線は、内容と一緒に動く', async () => {
+    await openEditor(longDocument());
+    await settledTotalPages();
+    const before = await breakTops();
+    const scrolled = await page.$eval('.md-editor-content', (element) => {
+      element.scrollTop = 300;
+      return element.scrollTop;
+    });
+    expect(scrolled).toBeGreaterThan(0);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const after = await breakTops();
+    expect(after).toHaveLength(before.length);
+    for (const [index, top] of before.entries()) {
+      expect(Math.abs((after[index] as number) - (top - scrolled))).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it('「Markdown」タブでは、区切り線は表示されない。プレビューに戻ると、再び表示される', async () => {
+    await openEditor(longDocument());
+    await settledTotalPages();
+    await clickButton('Markdown');
+    await page.waitForSelector('textarea[aria-label="Markdown"]');
+    expect(await page.$('.page-break')).toBeNull();
+    await clickButton('プレビュー');
+    await settledTotalPages();
+    expect((await breakPages()).length).toBeGreaterThan(0);
+  });
+
+  it('画像を埋め込んでも、測定のために、画像のデータは送らない(大きな画像でも、要求は軽い)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'md-pdf-editor-layout-'));
+    const sizes: number[] = [];
+    page.on('request', (request) => {
+      if (request.url().endsWith('/api/layout')) {
+        sizes.push((request.postData() ?? '').length);
+      }
+    });
+    await openEditor('# 画像\n\n本文です。');
+    await settledTotalPages();
+    // 大きな画像(ノイズなので、圧縮されず、数百KBになる)を作り、ドロップする
+    const noise = await page.evaluate(() => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 600;
+      canvas.height = 400;
+      const context = canvas.getContext('2d') as CanvasRenderingContext2D;
+      const data = context.createImageData(600, 400);
+      for (let index = 0; index < data.data.length; index += 4) {
+        data.data[index] = Math.random() * 255;
+        data.data[index + 1] = Math.random() * 255;
+        data.data[index + 2] = Math.random() * 255;
+        data.data[index + 3] = 255;
+      }
+      context.putImageData(data, 0, 0);
+      return canvas.toDataURL('image/png').split(',')[1] as string;
+    });
+    writeFileSync(join(dir, 'noise.png'), Buffer.from(noise, 'base64'));
+    expect(Buffer.from(noise, 'base64').length).toBeGreaterThan(500_000);
+    const box = (await (await page.$('.md-editor-content p'))?.boundingBox()) as { x: number; y: number; width: number; height: number };
+    const client = await page.createCDPSession();
+    for (const type of ['dragEnter', 'dragOver', 'drop'] as const) {
+      await client.send('Input.dispatchDragEvent', { type, x: box.x + box.width / 2, y: box.y + box.height / 2, data: { items: [], files: [join(dir, 'noise.png')], dragOperationsMask: 1 } });
+    }
+    await page.waitForSelector('.md-editor-content img');
+    // 画像を含む文書が、測り直される
+    await page.waitForFunction(() => document.querySelector('.page-status-stale, .page-break-stale') !== null, { timeout: 5_000 });
+    await settledTotalPages();
+    expect(sizes.length).toBeGreaterThan(1);
+    expect(Math.max(...sizes)).toBeLessThan(5_000);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
